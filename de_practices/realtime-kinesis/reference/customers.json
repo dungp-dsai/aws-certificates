@@ -1,0 +1,5 @@
+{"customer_id":"cust_001","home_country":"US","risk_tier":"low","account_age_days":820}
+{"customer_id":"cust_002","home_country":"US","risk_tier":"medium","account_age_days":40}
+{"customer_id":"cust_003","home_country":"DE","risk_tier":"high","account_age_days":15}
+{"customer_id":"cust_004","home_country":"US","risk_tier":"low","account_age_days":1200}
+{"customer_id":"cust_005","home_country":"BR","risk_tier":"high","account_age_days":6}
