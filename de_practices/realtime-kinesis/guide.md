@@ -19,8 +19,9 @@ You write the application code yourself while you build. Each phase below tells 
 
 | File you create | Phase | Runs as |
 | --- | --- | --- |
-| `train_toy_model.py` | 4 | Trains the logistic regression on your laptop |
-| `inference.py` | 4 | SageMaker endpoint code that scores one amount |
+| `produce_transactions.py` | 4 | EC2 producer that writes raw events to `transactions` |
+| `train_toy_model.py` | 5 | Trains the logistic regression on your laptop |
+| `inference.py` | 5 | SageMaker endpoint code that scores one amount |
 | `main.py` | 6 | Managed Flink application |
 | `aws_api_gateway.py` | 7 | Ingest Lambda behind API Gateway |
 | `generate_data_ec2.py` | 7 | EC2 (or laptop) transaction generator |
@@ -36,8 +37,7 @@ Several resources charge **per hour while they exist**, even when no transaction
 
 | Resource | When the bill grows |
 | --- | --- |
-| NAT Gateway | Every hour it exists, plus data processed |
-| MSK brokers (`kafka.t3.small` × 2) | Every hour the cluster exists |
+| MSK brokers (`kafka.t3.small` × 2) | Every hour the cluster exists. Public access also keeps one public IPv4 address per broker. |
 | Managed Flink application | Every hour the application is **running**. A small app is billed at about 2 KPUs (1 for the job, 1 for orchestration). **Stop** the application when you pause. |
 | OpenSearch domain | Every hour the domain exists |
 | MSK Connect workers | Every hour each connector worker exists |
@@ -48,7 +48,7 @@ Several resources charge **per hour while they exist**, even when no transaction
 
 Create an AWS Budget before the cluster. A **$25 monthly** cost budget with an email alert is a reasonable safety rail for a first run. Raise it if you intend to leave the stack up for several days. Search the console for **AWS Budgets → Create budget → Customize → Cost budget**, set the amount, and add your email.
 
-When you stop practicing, follow [Tear down](#tear-down) the same day. The expensive items are NAT, MSK, a running Flink app, OpenSearch, and MSK Connect.
+When you stop practicing, follow [Tear down](#tear-down) the same day. The expensive items are MSK, a running Flink app, OpenSearch, and MSK Connect.
 
 Tag every resource `Project = fraud-lab` so you can find stragglers.
 
@@ -121,11 +121,11 @@ Figure 3-1 is the left-to-right stream plus use cases 1, 2, and 3. The SageMaker
 ### How one transaction moves
 
 1. The EC2 generator (or your laptop) POSTs a JSON payment to API Gateway.
-2. API Gateway invokes the ingest Lambda. API Gateway has no native “write to MSK” integration, so this Lambda is the Kafka producer. It writes the record to the topic `transactions`, using `customer_id` as the partition key.
-3. Managed Flink reads that topic. For each event it:
+2. API Gateway invokes the ingest Lambda. The function is **not** in a VPC. It writes the record to the MSK topic `transactions` through the cluster’s **public** brokers, port **9198**. The partition key is `customer_id`. When `ENDPOINT_NAME` is set, the function calls SageMaker first and attaches `model_score` and `model_outcome`. Until the endpoint exists those fields are empty and `not_scored`.
+3. Managed Flink reads that topic from inside the default VPC, on the **private** brokers. For each event it:
    - looks up the customer in the S3 reference file (home country, risk tier, account age)
    - counts how many events that same customer produced in the last 5 minutes (Flink keyed state)
-   - calls the SageMaker endpoint with the transaction amount and reads back a fraud probability
+   - keeps the model fields the Lambda already wrote
    - writes one scored JSON record to the topic `processed_transactions`
 4. Three original consumers, plus Firehose, read that output topic independently. Each has its own consumer group, so each receives every record.
    - **Notification.** A Lambda function publishes to SNS only when `fraud_outcome` is `review`. SNS emails you.
@@ -138,8 +138,8 @@ Latencies are different on purpose. Learn these numbers so a “missing” recor
 
 | Hop | What you should expect |
 | --- | --- |
-| API Gateway → MSK | A few seconds. The Lambda returns `202` only after the broker ack. |
-| MSK → Flink → output topic → email | Usually under a minute after the Flink app is running and the SNS subscription is confirmed. The first SageMaker call after the endpoint has been idle can take longer, because serverless inference starts a container. |
+| API Gateway → MSK | A few seconds after the endpoint is warm. The Lambda returns `202` only after SageMaker responds and the broker acks. The first call after the endpoint has been idle can take about 20 seconds while the serverless container starts. |
+| MSK → Flink → output topic → email | Usually under a minute after the Flink app is running and the SNS subscription is confirmed. |
 | Firehose → S3 | The lab buffer is **60 seconds** or **1 MB**, whichever comes first. Tiny events wait for the timer. |
 | S3 → Redshift | Happens when **you** run `COPY`. Firehose does not load Redshift by itself in this lab. |
 
@@ -190,7 +190,7 @@ Scored record, produced by Flink. Downstream systems all use this shape.
 
 Who sets `fraud_outcome`:
 
-- The SageMaker model returns a probability in `model_score`. Flink sets `model_outcome` to `review` when that score is at least `0.5`, and to `approve` otherwise. The toy model was trained so amounts over about 400 score high and smaller amounts score low.
+- The ingest Lambda calls SageMaker and stores the probability in `model_score`. It sets `model_outcome` to `review` when that score is at least `0.5`, and to `approve` otherwise. The toy model was trained so amounts over about 400 score high and smaller amounts score low.
 - Flink overrides the final `fraud_outcome` to `review` when the customer transacts outside their home country for more than $200, or when they send 4 or more events in five minutes.
 - A small amount can still be `fraud_outcome` `review` when the stream rules fire. `model_outcome` stays `approve` in that case, so you can see which component made the decision.
 
@@ -198,12 +198,9 @@ Who sets `fraud_outcome`:
 
 ```text
 Region                         us-east-1
-VPC                            fraud-lab-vpc          10.20.0.0/16
-Public subnet A                fraud-lab-public-a     10.20.0.0/24
-Public subnet B                fraud-lab-public-b     10.20.1.0/24
-Private subnet A               fraud-lab-private-a    10.20.10.0/24
-Private subnet B               fraud-lab-private-b    10.20.11.0/24
-NAT Gateway                    fraud-lab-nat
+VPC                            the default VPC (do not create one)
+Subnets                        any two default subnets in different AZs
+Security group                 fraud-lab
 S3 bucket                      fraud-lab-<ACCOUNT_ID>-us-east-1
 MSK cluster                    fraud-lab-msk
 Input topic                    transactions
@@ -222,11 +219,7 @@ Redshift workgroup             fraud-lab-wg
 OpenSearch domain              fraud-lab-search
 ```
 
-```bash
-aws sts get-caller-identity --query Account --output text
-```
-
-Substitute that value wherever you see `<ACCOUNT_ID>`.
+Click your name in the top-right of the console. Copy the 12-digit account ID. Substitute that value wherever you see `<ACCOUNT_ID>`.
 
 ---
 
@@ -239,7 +232,7 @@ Read this section before the console steps. The steps tell you what to click. Th
 EC2 is a virtual machine you run in your VPC. In production the clients are the shopper’s phone and the merchant’s backend, drawn outside the AWS cloud in the figure. For a lab you need a machine you control that can:
 
 - call the public API Gateway endpoint, which is the real client path
-- open a Kafka client to the **private** MSK brokers, which a laptop on your home network cannot do
+- open a Kafka client to the private MSK brokers on port 9098, from inside the same VPC
 - `curl` OpenSearch, which also lives on private IPs
 
 The instance is Amazon Linux 2023, size `t3.micro`, in the public subnet, with a public IP so you can SSH. Its instance profile (an IAM role attached to the instance) is allowed to produce and consume both topics. You do not copy access keys onto the box.
@@ -254,19 +247,19 @@ The lab uses an **HTTP API** (the cheaper, smaller API Gateway mode) with one ro
 
 Turn on **access logs** to CloudWatch while you create the stage. Each line is one request: IP, route, status, latency. That log is the first place to look when the generator prints an HTTP error.
 
-A `202` from the Lambda means “MSK accepted the record,” not “the payment is approved.” Approval happens later, on the stream. Returning before scoring keeps the checkout path short. The caller can poll another API, or wait for the email, if they need the decision. This lab does not build that read API.
+A `202` from the Lambda means MSK accepted the record. The response body also includes `model_outcome` and `model_score`. Flink still applies the country and velocity checks after that, so an email can say review when this response said approve.
 
 ### AWS Lambda, ingest
 
-The ingest function, which you write in phase 7 as `aws_api_gateway.py`, validates the body, fills `transaction_id` and `event_timestamp`, and produces one Kafka record.
+The ingest function, which you write in phase 7 as `aws_api_gateway.py`, calls the SageMaker endpoint, then validates the body, fills `transaction_id` and `event_timestamp`, and produces one Kafka record.
 
-The function runs **inside the VPC**, in the private subnets, because the MSK brokers have no public endpoint. Lambda’s own service still invokes it; you do not expose the function to the internet. API Gateway reaches Lambda through the Lambda service, then the function’s network interface reaches MSK on port **9098** (the IAM-auth broker port).
+Leave this function **out of every VPC**. A Lambda function placed in a VPC does not get a public IP, so it would need a NAT Gateway to reach SageMaker. The default VPC already has an internet gateway, and a Lambda that is not attached to a VPC uses that path for you. The function reaches MSK on the public bootstrap string, port **9198**. IAM is what allows the write. API Gateway invokes the function through the Lambda service.
 
-The Kafka client uses IAM (`OAUTHBEARER` plus `aws-msk-iam-sasl-signer`). There is no username or password. The function’s execution role is the identity MSK checks.
+The Kafka client uses IAM (`OAUTHBEARER` plus `aws-msk-iam-sasl-signer-python`). There is no username or password. The function’s execution role is the identity MSK checks.
 
 `acks=all` waits until the record is replicated to the in-sync replicas. Combined with `future.get()`, the HTTP call fails if MSK did not take the write. That is the behavior you want while learning. A high-volume API would return sooner and handle a failed ack with a retry queue.
 
-CloudWatch Logs for this function is the log group `/aws/lambda/fraud-lab-ingest`. A timeout almost always means the security group path to port 9098 is closed, or the bootstrap string is the TLS port (9094) instead of the IAM port (9098).
+CloudWatch Logs for this function is the log group `/aws/lambda/fraud-lab-ingest`. A timeout on the first call is often the SageMaker serverless cold start. Retry once. A timeout after that usually means `BOOTSTRAP_SERVERS` is the private port **9098** string. This function needs the public string, port **9198**.
 
 ### Amazon MSK
 
@@ -316,11 +309,11 @@ A production job would refresh that file on a timer or broadcast a second stream
 
 The bucket blocks all public access. Nothing in this lab needs a public object.
 
-An **S3 gateway VPC endpoint** on the private route table lets Flink, Redshift, and MSK Connect reach S3 without sending that traffic through the NAT Gateway. The endpoint is free. NAT is still required for `InvokeEndpoint`, because the SageMaker runtime API is reached over the public service endpoint.
+An **S3 gateway endpoint** on the default VPC’s main route table lets Flink, Redshift, and MSK Connect reach S3. The endpoint is free. You add it in phase 1. It is the only extra network object in this lab.
 
 ### Amazon SageMaker endpoint
 
-SageMaker hosts the model that used to be Amazon Fraud Detector in the figure. The lab model is deliberately small: a scikit-learn logistic regression with a single input, `amount`. You label the training rows yourself (`1` when amount is at least 400, `0` otherwise), fit the model on your laptop, and deploy it to a **serverless** endpoint. Flink sends `{"amount": 850}` and reads back `{"score": 0.97, "prediction": 1}`.
+SageMaker hosts the model that used to be Amazon Fraud Detector in the figure. The lab model is deliberately small: a scikit-learn logistic regression with a single input, `amount`. You label the training rows yourself (`1` when amount is at least 400, `0` otherwise), fit the model on your laptop, and deploy it to a **serverless** endpoint. The ingest Lambda sends `{"amount": 850}` and reads back `{"score": 0.97, "prediction": 1}`.
 
 Serverless means there is no `ml.*` instance running between calls. You pay for inference time. The first call after a quiet period waits while SageMaker starts the container. A provisioned real-time instance skips that wait and bills every hour, which is the wrong default for this lab.
 
@@ -331,10 +324,10 @@ Serverless means there is no `ml.*` instance running between calls. You pay for 
 | Label | `1` if amount ≥ 400, else `0` | The model learns the same cut the old rules used, so the rest of the lab stays predictable. |
 | Artifact | `model.tar.gz` containing `model.joblib` | What the endpoint downloads from S3. |
 | Entry point | `inference.py` in `sourcedir.tar.gz` | `model_fn`, `input_fn`, `predict_fn`, `output_fn`. |
-| Endpoint | `fraud-lab-endpoint`, serverless, 1024 MB, concurrency 1 | The URL Flink calls. |
-| Decision | score ≥ 0.5 → `review` | Applied in Flink, from the runtime property `score.threshold`. |
+| Endpoint | `fraud-lab-endpoint`, serverless, 1024 MB, concurrency 1 | What the ingest Lambda calls. |
+| Decision | score ≥ 0.5 → `review` | Applied in the Lambda, from the environment variable `SCORE_THRESHOLD`. |
 
-`InvokeEndpoint` is a public AWS API. The Flink nodes sit in private subnets, so the NAT Gateway is what makes this call possible. The IAM action is `sagemaker:InvokeEndpoint` on the endpoint ARN. The client in code is `boto3.client("sagemaker-runtime")`, which is a different service name from the control-plane client `boto3.client("sagemaker")` you use to create the endpoint.
+`InvokeEndpoint` is a public AWS API. The Lambda is left outside the VPC so this call works with no NAT Gateway. The IAM action is `sagemaker:InvokeEndpoint` on the endpoint ARN. The client in code is `boto3.client("sagemaker-runtime")`, which is a different service name from the control-plane client `boto3.client("sagemaker")` you use to create the endpoint.
 
 ### Amazon Managed Service for Apache Flink
 
@@ -344,7 +337,7 @@ The job you write in phase 6 as `main.py` is one pipeline:
 
 1. **Source.** Kafka consumer on `transactions`, IAM auth, starting at **latest** so a redeploy does not rescore the whole history.
 2. **Key by** `customer_id`.
-3. **Process function.** Keyed state (`ListState` of timestamps) keeps the 5-minute velocity count. The same function loads reference data, calls the SageMaker endpoint, and emits one JSON string.
+3. **Process function.** Keyed state (`ListState` of timestamps) keeps the 5-minute velocity count. The same function loads reference data, copies `model_score` and `model_outcome` from the record, and emits one JSON string.
 4. **Sink.** Kafka producer to `processed_transactions`.
 
 Checkpointing is every 60 seconds, stored in `s3://<bucket>/flink-snapshots/`. On a crash, Managed Flink restarts from the last successful checkpoint, including the velocity state and the Kafka offsets. That is the reason to use Flink here instead of a Lambda that forgets everything when the invocation ends.
@@ -353,7 +346,7 @@ Parallelism is 1. Combined with two partitions, one subtask reads both partition
 
 Print statements such as `FLINK_SCORED ...` show up in the Flink CloudWatch log group once logging is enabled. Enable it at creation time.
 
-The application must be attached to the private subnets and to `sg-flink`. Managed Flink creates network interfaces in those subnets. Those interfaces need a route to MSK (security groups) and a route to the internet (NAT) for the SageMaker runtime API.
+The application must be attached to the default VPC, the two default subnets, and the security group `fraud-lab`. It reads MSK on the private port 9098 and reads the reference file through the S3 gateway endpoint. It does not call SageMaker.
 
 Stop the application from the console when you are not sending events. Deleting the VPC while a Flink app is still running leaves network interfaces behind and blocks VPC deletion.
 
@@ -401,7 +394,7 @@ This path and the Firehose path both end in S3. They are different tools:
 
 Firehose reads a source and delivers files to a destination. You do not run consumers or manage shards.
 
-This stream’s source is the MSK topic `processed_transactions`. The MSK integration delivers to **S3**. (The console will only offer S3 once the source is MSK.) Firehose creates network interfaces in your private subnets, joins the topic with IAM, batches records, and puts objects under `analytics/scored/`.
+This stream’s source is the MSK topic `processed_transactions`. The MSK integration delivers to **S3**. (The console will only offer S3 once the source is MSK.) Firehose creates network interfaces in the two default subnets, joins the topic with IAM on port 9098, batches records, and puts objects under `analytics/scored/`.
 
 Turn on **newline delimiter** so each Kafka record becomes one line. Redshift’s `COPY ... FORMAT AS JSON 'auto'` reads that shape.
 
@@ -442,15 +435,15 @@ MSK broker log shipping is optional and noisy. Leave it off until you are debugg
 
 ## Build order
 
-MSK takes 20–40 minutes to become Active. Start it as soon as the VPC exists, then build S3, IAM, and the SageMaker endpoint while you wait.
+MSK takes 20–40 minutes to become Active. Start it as soon as you have picked the default subnets, then build S3, IAM, and the EC2 instance while you wait. Run the producer once the cluster is Active. The SageMaker endpoint comes after you have seen records on the topic. Turning on public access is a second wait after the cluster is Active. Start that before phase 7.
 
 | Phase | You finish when |
 | --- | --- |
-| 1. Budget and VPC | Private subnets route to NAT, and an S3 gateway endpoint is on the private route table |
+| 1. Default VPC | You picked two default subnets, created `fraud-lab`, and added the S3 gateway endpoint |
 | 2. MSK | Cluster status is Active |
-| 3. S3 and IAM | Bucket exists, roles exist |
-| 4. SageMaker endpoint | `aws sagemaker-runtime invoke-endpoint` returns a score near 1 for amount 850 and near 0 for amount 20 |
-| 5. EC2 and topics | You can produce and consume a test record |
+| 3. S3 and IAM | Bucket exists, `fraud-lab-role` exists |
+| 4. EC2 producer | `produce_transactions.py` prints lines and the consumer shows them on `transactions` |
+| 5. SageMaker endpoint | The endpoint status is InService |
 | 6. Flink | A test record appears on `processed_transactions` with `fraud_outcome` set |
 | 7. API Gateway and ingest Lambda | `curl` returns `202` and Flink scores that record |
 | 8. SNS and notify Lambda | A review event sends an email |
@@ -463,50 +456,36 @@ Phases 11 and 12 can wait until the next sitting. Phases 1–10 are the path tha
 
 ---
 
-## Phase 1. Network
+## Phase 1. Use the default VPC
 
-You need a VPC with two Availability Zones. MSK, Flink, Firehose, and Redshift all refuse to run in a single subnet.
+Do not create a VPC. Every AWS account already has a **default VPC**: a subnet in each Availability Zone, an internet gateway, and a route to the internet. MSK, EC2, Flink, Firehose, Redshift, and OpenSearch go there. The two Lambda functions and the SageMaker endpoint stay off the VPC, because they only call public AWS APIs.
 
-In the VPC console, create a VPC **manually** (the wizard’s “public and private” preset is fine if you then fix the names and CIDRs below).
+MSK still needs two subnets in two Availability Zones. That is a service rule, and the default VPC already satisfies it.
 
-| Resource | Value |
-| --- | --- |
-| VPC CIDR | `10.20.0.0/16` |
-| Public subnet A | `10.20.0.0/24` in the first AZ, name `fraud-lab-public-a` |
-| Public subnet B | `10.20.1.0/24` in the second AZ, name `fraud-lab-public-b` |
-| Private subnet A | `10.20.10.0/24` in the first AZ, name `fraud-lab-private-a` |
-| Private subnet B | `10.20.11.0/24` in the second AZ, name `fraud-lab-private-b` |
-| Internet gateway | `fraud-lab-igw`, attached to the VPC |
-| Public route table | `0.0.0.0/0` → internet gateway. Associated with both public subnets. |
-| NAT Gateway | In `fraud-lab-public-a`, name `fraud-lab-nat`. Allocate an Elastic IP for it. |
-| Private route table | `0.0.0.0/0` → `fraud-lab-nat`. Associated with both private subnets. |
+1. VPC → Your VPCs. Find the VPC whose **Default VPC** column is Yes. Leave it alone.
+2. VPC → Subnets. Filter by that VPC. Pick two subnets whose Availability Zones differ. Write down both subnet IDs. You will paste them into MSK, Flink, Firehose, and Redshift.
+3. Confirm each of those subnets has **Auto-assign public IPv4 address** set to Yes. Default subnets do.
 
-One NAT in a single AZ is a lab shortcut. If that AZ fails, private subnets in both AZs lose internet access. A production VPC puts a NAT in each AZ.
+One security group, named `fraud-lab`, in the default VPC. Leave the outbound rule as allow-all.
 
-S3 gateway endpoint:
+| Inbound | Source | Why |
+| --- | --- | --- |
+| TCP 9098 | `fraud-lab` itself | EC2, Flink, Firehose, and MSK Connect reach the private brokers |
+| TCP 9198 | `0.0.0.0/0` | The ingest Lambda is outside the VPC, so it uses the public brokers. IAM still rejects callers who are not the Lambda role. Close this when you delete the lab. |
+| TCP 22 | Your current public IP `/32` | SSH to EC2 |
+| TCP 443 | `fraud-lab` itself | EC2 and MSK Connect reach OpenSearch |
+
+Your IP changes. When SSH starts timing out, update the port 22 rule.
+
+S3 gateway endpoint, so Flink, Redshift `COPY`, and MSK Connect can use the bucket:
 
 1. VPC → Endpoints → Create endpoint.
-2. Service: `com.amazonaws.us-east-1.s3`, type Gateway.
-3. VPC: `fraud-lab-vpc`.
-4. Route tables: the **private** route table.
-5. Name: `fraud-lab-s3`.
+2. Name: `fraud-lab-s3`.
+3. Service: `com.amazonaws.us-east-1.s3`, type Gateway.
+4. VPC: the default VPC.
+5. Route tables: the main route table of the default VPC.
 
-Security groups. Leave the default outbound rule (all traffic) on each of them.
-
-| Security group | Inbound |
-| --- | --- |
-| `sg-msk` | TCP 9098 from `sg-ec2`, `sg-lambda`, `sg-flink`, `sg-firehose`, `sg-connect` |
-| `sg-ec2` | TCP 22 from your current public IP `/32` |
-| `sg-lambda` | none |
-| `sg-flink` | none |
-| `sg-firehose` | none |
-| `sg-connect` | none |
-| `sg-opensearch` | TCP 443 from `sg-ec2` and `sg-connect` |
-| `sg-redshift` | none from the internet. Query editor v2 does not need an inbound rule from your laptop. |
-
-Your IP changes. When SSH starts timing out, update `sg-ec2`.
-
-Checkpoint: in the private route table you see `0.0.0.0/0` to the NAT and a prefix-list route to the S3 endpoint.
+Checkpoint: you created a security group and one gateway endpoint. The default VPC is unchanged.
 
 ---
 
@@ -526,126 +505,125 @@ MSK → Clusters → Create cluster.
 | Brokers | 2 |
 | Broker storage | 10 GiB |
 | Apache ZooKeeper or KRaft | Leave the console default |
-| VPC | `fraud-lab-vpc` |
-| Subnets | `fraud-lab-private-a` and `fraud-lab-private-b` only |
-| Security group | `sg-msk` |
-| Public access | Off |
+| VPC | the default VPC |
+| Subnets | the two default subnets from phase 1 |
+| Security group | `fraud-lab` |
+| Public access | Off at create time. You turn it on in the next step, after the cluster is Active. |
 | Authentication | IAM access control. Clear unauthenticated and SASL/SCRAM. |
 | Encryption in transit | TLS, required |
 | Monitoring | Per topic |
 
-Create the cluster. Continue below while the status is Creating.
+Create the cluster. Continue with phases 3 and 4 while the status is Creating.
+
+### Turn on public access
+
+Do this once the cluster is **Active**. AWS does not allow public access on the create screen. The ingest Lambda needs it. EC2 and Flink do not: they keep using port 9098 inside the VPC.
+
+1. MSK → `fraud-lab-msk` → Properties → Network settings → Edit public access.
+2. Turn public access on.
+3. Wait until the cluster is Active again. This often takes another 15–30 minutes.
+
+The security group rule for port 9198 is what makes that public address reachable. IAM is what decides who may produce.
 
 ---
 
-## Phase 3. S3 bucket and IAM roles
+## Phase 3. S3 bucket and one IAM role
+
+This phase creates no stream and no model. It creates the file cabinet and one role, `fraud-lab-role`. Do it while the MSK cluster is still provisioning. Every later screen that asks for an IAM role means this same role.
+
+### Why this lab has one S3 bucket
+
+MSK holds the live events for a few days, then they age out. S3 is where a copy stays so you can train the model, restart Flink, and query Redshift tomorrow. One bucket is enough. The folder inside the bucket tells you which service wrote it.
+
+| Prefix | Who writes it | Who reads it | You need it because |
+| --- | --- | --- | --- |
+| `reference/customers.json` | You, once, in this phase | Flink | Home country and risk tier are not on the payment event. Flink looks them up here. |
+| `models/fraud-toy/` | You, in phase 5 | SageMaker | The endpoint downloads `model.tar.gz` and `inference.py` from here when it starts. |
+| `flink-snapshots/` | Flink, while the app is running | Flink, on restart | The 5-minute velocity count and the Kafka offset live in these snapshots. |
+| `analytics/scored/` | Firehose | Redshift `COPY` | This is the warehouse path. Firehose lands the scored JSON; Redshift loads those files. |
+| `logs/connect/` | MSK Connect, phase 12 | You | The raw logging copy from the figure. Skip until you build use case 3. |
+| `plugins/` | You, phase 12 | MSK Connect | The connector zip files. Skip until phase 12. |
+| `layers/` | You, phase 7 | Lambda | The Kafka library zip for the ingest function. |
+
+Create the bucket and upload `reference/customers.json` now. The other prefixes appear when a later phase writes its first object. You do not make those folders by hand.
+
+### One role
+
+The user you log in with is what clicks Create in the console. Lambda, Flink, SageMaker, Firehose, EC2, Redshift, and MSK Connect run as a role. This lab uses one role for all of them: `fraud-lab-role`.
+
+The role has two parts. The trust policy lists which services may assume it. The permission list is in **Create `fraud-lab-role`**, after the bucket. Add those permissions once. Later phases only select this role.
+
+On the EC2 launch screen the instance profile is also named `fraud-lab-role`. Starting the role from the EC2 use case is what puts that name in the list.
 
 ### Bucket
 
-```bash
-ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-BUCKET="fraud-lab-${ACCOUNT_ID}-us-east-1"
-aws s3 mb "s3://${BUCKET}" --region us-east-1
-aws s3api put-public-access-block \
-  --bucket "$BUCKET" \
-  --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
-```
+S3 → Create bucket.
 
-Upload the reference file from this folder:
-
-```bash
-aws s3 cp reference/customers.json "s3://${BUCKET}/reference/customers.json"
-```
-
-Add a lifecycle rule that expires objects under `logs/` and `analytics/` after 7 days. S3 → bucket → Management → Lifecycle rules → prefix `logs/`, and a second rule for `analytics/`. The reference file and the connector plugins sit outside those prefixes, so the rule will not delete them.
-
-### How MSK IAM policies are shaped
-
-MSK checks two namespaces:
-
-- `kafka:` actions (`GetBootstrapBrokers`, `DescribeCluster`) are the control plane. Your console user already has these if you can create the cluster.
-- `kafka-cluster:` actions are the data plane, checked on every produce and consume. The resource ARNs use `cluster/`, `topic/`, and `group/`.
-
-After the cluster is Active, this prints the cluster ARN and the UUID inside it:
-
-```bash
-aws kafka list-clusters-v2 --region us-east-1 \
-  --query "ClusterInfoList[?ClusterName=='fraud-lab-msk'].ClusterArn" --output text
-```
-
-In the policies below, `cluster/fraud-lab-msk/*` matches that cluster. If an `AccessDenied` message quotes a full topic ARN, paste that ARN into the policy. The usual miss is a policy that allows the cluster ARN and omits the topic ARN.
-
-### Trust policies
-
-Lambda roles trust `lambda.amazonaws.com`. Flink trusts `kinesisanalytics.amazonaws.com`. Firehose trusts `firehose.amazonaws.com`. MSK Connect trusts `kafkaconnect.amazonaws.com`. EC2 trusts `ec2.amazonaws.com`. Redshift trusts `redshift.amazonaws.com`.
-
-Example, the ingest role:
-
-```bash
-aws iam create-role \
-  --role-name fraud-lab-lambda-ingest-role \
-  --assume-role-policy-document '{
-    "Version": "2012-10-17",
-    "Statement": [{
-      "Effect": "Allow",
-      "Principal": {"Service": "lambda.amazonaws.com"},
-      "Action": "sts:AssumeRole"
-    }]
-  }'
-```
-
-Create the same way, changing the role name and the service principal:
-
-| Role | Principal |
+| Setting | Value |
 | --- | --- |
-| `fraud-lab-lambda-ingest-role` | `lambda.amazonaws.com` |
-| `fraud-lab-lambda-notify-role` | `lambda.amazonaws.com` |
-| `fraud-lab-flink-role` | `kinesisanalytics.amazonaws.com` |
-| `fraud-lab-firehose-role` | `firehose.amazonaws.com` |
-| `fraud-lab-connect-role` | `kafkaconnect.amazonaws.com` |
-| `fraud-lab-ec2-role` | `ec2.amazonaws.com` |
-| `fraud-lab-redshift-copy-role` | `redshift.amazonaws.com` |
-| `fraud-lab-sagemaker-role` | `sagemaker.amazonaws.com` |
+| Bucket name | `fraud-lab-<ACCOUNT_ID>-us-east-1` |
+| Region | US East (N. Virginia) `us-east-1` |
+| Block all public access | On. Leave the four boxes checked. |
 
-Attach the AWS managed policy `AWSLambdaVPCAccessExecutionRole` to **both** Lambda roles. It covers CloudWatch Logs and the network interfaces a VPC function creates. The notify function stays outside the VPC; the managed policy is still a simple way to grant its log permissions.
+Create the bucket. Open it → Create folder `reference` → Upload `customers.json` from `de_practices/realtime-kinesis/reference/`. The object key must be `reference/customers.json`.
 
-Attach `AmazonSSMManagedInstanceCore` to the EC2 role if you want Session Manager as a backup to SSH. Optional.
+Management → Create lifecycle rule. One rule for prefix `logs/`, another for `analytics/`. Expire current versions after 7 days. The reference file and the connector plugins sit outside those prefixes, so the rules leave them alone.
 
-### Ingest role, data-plane policy
+### Create `fraud-lab-role`
 
-Save as `ingest-policy.json` (replace the Region and account if needed) and attach it to `fraud-lab-lambda-ingest-role`.
+IAM → Roles → Create role.
+
+1. Trusted entity type: **AWS service**. Use case: **EC2**. Next.
+2. Attach the managed policy `AmazonSageMakerFullAccess`. Next.
+3. Role name: `fraud-lab-role`. Create role.
+
+Starting from the EC2 use case is what makes this role appear on the EC2 launch screen. Open the role → **Trust relationships** → Edit trust policy, and replace the policy with the JSON below so the other services can assume the same role. `kinesisanalytics.amazonaws.com` is the name Flink still uses. The console label is Amazon Managed Service for Apache Flink.
 
 ```json
 {
   "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": ["kafka-cluster:Connect", "kafka-cluster:DescribeCluster"],
-      "Resource": "arn:aws:kafka:us-east-1:<ACCOUNT_ID>:cluster/fraud-lab-msk/*"
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": {
+      "Service": [
+        "lambda.amazonaws.com",
+        "kinesisanalytics.amazonaws.com",
+        "firehose.amazonaws.com",
+        "kafkaconnect.amazonaws.com",
+        "ec2.amazonaws.com",
+        "redshift.amazonaws.com",
+        "redshift-serverless.amazonaws.com",
+        "sagemaker.amazonaws.com"
+      ]
     },
-    {
-      "Effect": "Allow",
-      "Action": [
-        "kafka-cluster:DescribeTopic",
-        "kafka-cluster:WriteData"
-      ],
-      "Resource": "arn:aws:kafka:us-east-1:<ACCOUNT_ID>:topic/fraud-lab-msk/*"
-    }
-  ]
+    "Action": "sts:AssumeRole"
+  }]
 }
 ```
 
-```bash
-aws iam put-role-policy \
-  --role-name fraud-lab-lambda-ingest-role \
-  --policy-name fraud-lab-ingest-msk \
-  --policy-document file://ingest-policy.json
-```
+### Permissions to add
 
-### Notify role
+On the role, Add permissions → Create inline policy → JSON. Name the policy `fraud-lab-permissions`. Replace `<ACCOUNT_ID>` with the account ID from the top-right menu. `AmazonSageMakerFullAccess` is already attached. That managed policy lets the endpoint pull the AWS scikit-learn image and write its own logs. It only allows S3 buckets with `sagemaker` in the name, so the S3 lines in the inline policy are what let the endpoint read `models/`.
 
-The event source mapping also needs permission to describe the cluster and to join a consumer group.
+Optional: attach `AmazonSSMManagedInstanceCore` if you want Session Manager on the EC2 box as a backup to SSH.
+
+| Permission | Why the lab needs it |
+| --- | --- |
+| `kafka:DescribeCluster`, `kafka:GetBootstrapBrokers`, `kafka:ListScramSecrets` | Lambda, Firehose, and Connect look up the broker list |
+| `kafka-cluster:Connect`, `kafka-cluster:DescribeCluster` | Every client opens a connection to the cluster |
+| `kafka-cluster:DescribeTopic`, `kafka-cluster:WriteData` | Ingest Lambda and Flink produce records |
+| `kafka-cluster:ReadData` | Flink, the notify Lambda, Firehose, and Connect consume records |
+| `kafka-cluster:CreateTopic`, `kafka-cluster:AlterTopic` | The EC2 box creates the two topics |
+| `kafka-cluster:DescribeGroup`, `kafka-cluster:AlterGroup` | A consumer joins a group |
+| `sagemaker:InvokeEndpoint` | The ingest Lambda scores `amount` |
+| `s3:GetObject`, `s3:ListBucket`, `s3:GetBucketLocation` | Flink reads `reference/`, SageMaker reads `models/`, Redshift `COPY` reads `analytics/` |
+| `s3:PutObject`, `s3:DeleteObject`, `s3:AbortMultipartUpload`, `s3:ListBucketMultipartUploads`, `s3:ListMultipartUploadParts` | Flink writes snapshots, Firehose writes `analytics/`, Connect writes `logs/` |
+| `sns:Publish` | The notify Lambda sends the email |
+| `logs:CreateLogGroup`, `logs:CreateLogStream`, `logs:PutLogEvents`, `logs:DescribeLogGroups`, `logs:DescribeLogStreams` | Lambda, Flink, and Firehose write CloudWatch |
+| `ec2:CreateNetworkInterface`, `ec2:CreateNetworkInterfacePermission`, `ec2:DescribeNetworkInterfaces`, `ec2:DescribeVpcs`, `ec2:DescribeSubnets`, `ec2:DescribeSecurityGroups`, `ec2:DescribeDhcpOptions`, `ec2:DeleteNetworkInterface`, `ec2:AssignPrivateIpAddresses`, `ec2:UnassignPrivateIpAddresses`, `ec2:CreateTags` | Flink, Firehose, and Connect place a network interface in the default VPC |
+| `es:ESHttpGet`, `es:ESHttpPost`, `es:ESHttpPut`, `es:ESHttpHead` | MSK Connect calls OpenSearch in phase 12 |
+
+`kafka:` is the control plane. `kafka-cluster:` is checked on every produce and consume. The resource ARNs use `cluster/`, `topic/`, and `group/`. The policy below allows all three. If an `AccessDenied` message quotes a full topic ARN, that ARN is missing from the policy.
 
 ```json
 {
@@ -660,253 +638,6 @@ The event source mapping also needs permission to describe the cluster and to jo
       ],
       "Resource": "arn:aws:kafka:us-east-1:<ACCOUNT_ID>:cluster/fraud-lab-msk/*"
     },
-    {
-      "Effect": "Allow",
-      "Action": ["kafka-cluster:Connect", "kafka-cluster:DescribeCluster"],
-      "Resource": "arn:aws:kafka:us-east-1:<ACCOUNT_ID>:cluster/fraud-lab-msk/*"
-    },
-    {
-      "Effect": "Allow",
-      "Action": [
-        "kafka-cluster:DescribeTopic",
-        "kafka-cluster:ReadData"
-      ],
-      "Resource": "arn:aws:kafka:us-east-1:<ACCOUNT_ID>:topic/fraud-lab-msk/*"
-    },
-    {
-      "Effect": "Allow",
-      "Action": [
-        "kafka-cluster:AlterGroup",
-        "kafka-cluster:DescribeGroup"
-      ],
-      "Resource": "arn:aws:kafka:us-east-1:<ACCOUNT_ID>:group/fraud-lab-msk/*"
-    },
-    {
-      "Effect": "Allow",
-      "Action": "sns:Publish",
-      "Resource": "arn:aws:sns:us-east-1:<ACCOUNT_ID>:fraud-lab-alerts"
-    }
-  ]
-}
-```
-
-Attach that inline policy to `fraud-lab-lambda-notify-role`.
-
-### Flink role
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": [
-        "kafka-cluster:Connect",
-        "kafka-cluster:DescribeCluster",
-        "kafka-cluster:ReadData",
-        "kafka-cluster:WriteData",
-        "kafka-cluster:DescribeTopic",
-        "kafka-cluster:DescribeGroup",
-        "kafka-cluster:AlterGroup"
-      ],
-      "Resource": [
-        "arn:aws:kafka:us-east-1:<ACCOUNT_ID>:cluster/fraud-lab-msk/*",
-        "arn:aws:kafka:us-east-1:<ACCOUNT_ID>:topic/fraud-lab-msk/*",
-        "arn:aws:kafka:us-east-1:<ACCOUNT_ID>:group/fraud-lab-msk/*"
-      ]
-    },
-    {
-      "Effect": "Allow",
-      "Action": ["s3:GetObject"],
-      "Resource": "arn:aws:s3:::fraud-lab-<ACCOUNT_ID>-us-east-1/reference/*"
-    },
-    {
-      "Effect": "Allow",
-      "Action": ["s3:ListBucket"],
-      "Resource": "arn:aws:s3:::fraud-lab-<ACCOUNT_ID>-us-east-1"
-    },
-    {
-      "Effect": "Allow",
-      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"],
-      "Resource": [
-        "arn:aws:s3:::fraud-lab-<ACCOUNT_ID>-us-east-1",
-        "arn:aws:s3:::fraud-lab-<ACCOUNT_ID>-us-east-1/flink-snapshots/*"
-      ]
-    },
-    {
-      "Effect": "Allow",
-      "Action": ["sagemaker:InvokeEndpoint"],
-      "Resource": "arn:aws:sagemaker:us-east-1:<ACCOUNT_ID>:endpoint/fraud-lab-endpoint"
-    },
-    {
-      "Effect": "Allow",
-      "Action": [
-        "logs:DescribeLogGroups",
-        "logs:DescribeLogStreams",
-        "logs:PutLogEvents",
-        "logs:CreateLogStream"
-      ],
-      "Resource": "*"
-    },
-    {
-      "Effect": "Allow",
-      "Action": [
-        "ec2:CreateNetworkInterface",
-        "ec2:CreateNetworkInterfacePermission",
-        "ec2:DescribeNetworkInterfaces",
-        "ec2:DescribeVpcs",
-        "ec2:DescribeSubnets",
-        "ec2:DescribeSecurityGroups",
-        "ec2:DeleteNetworkInterface",
-        "ec2:AssignPrivateIpAddresses",
-        "ec2:UnassignPrivateIpAddresses"
-      ],
-      "Resource": "*"
-    }
-  ]
-}
-```
-
-`sagemaker:InvokeEndpoint` is scoped to `fraud-lab-endpoint`. Create the endpoint in phase 4 before you run Flink. The action name is `sagemaker:` even though the boto3 client is `sagemaker-runtime`.
-
-### Firehose role
-
-Firehose needs the data-plane read, permission to place its network interfaces, and permission to write the analytics prefix and the error log group.
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": [
-        "kafka:DescribeCluster",
-        "kafka:GetBootstrapBrokers"
-      ],
-      "Resource": "arn:aws:kafka:us-east-1:<ACCOUNT_ID>:cluster/fraud-lab-msk/*"
-    },
-    {
-      "Effect": "Allow",
-      "Action": [
-        "kafka-cluster:Connect",
-        "kafka-cluster:DescribeCluster",
-        "kafka-cluster:DescribeTopic",
-        "kafka-cluster:ReadData",
-        "kafka-cluster:DescribeGroup",
-        "kafka-cluster:AlterGroup"
-      ],
-      "Resource": [
-        "arn:aws:kafka:us-east-1:<ACCOUNT_ID>:cluster/fraud-lab-msk/*",
-        "arn:aws:kafka:us-east-1:<ACCOUNT_ID>:topic/fraud-lab-msk/*",
-        "arn:aws:kafka:us-east-1:<ACCOUNT_ID>:group/fraud-lab-msk/*"
-      ]
-    },
-    {
-      "Effect": "Allow",
-      "Action": ["s3:AbortMultipartUpload", "s3:GetBucketLocation", "s3:GetObject", "s3:ListBucket", "s3:ListBucketMultipartUploads", "s3:PutObject"],
-      "Resource": [
-        "arn:aws:s3:::fraud-lab-<ACCOUNT_ID>-us-east-1",
-        "arn:aws:s3:::fraud-lab-<ACCOUNT_ID>-us-east-1/*"
-      ]
-    },
-    {
-      "Effect": "Allow",
-      "Action": ["logs:PutLogEvents", "logs:CreateLogStream"],
-      "Resource": "arn:aws:logs:us-east-1:<ACCOUNT_ID>:log-group:/aws/kinesisfirehose/fraud-lab-scored:*"
-    },
-    {
-      "Effect": "Allow",
-      "Action": [
-        "ec2:CreateNetworkInterface",
-        "ec2:DescribeNetworkInterfaces",
-        "ec2:DescribeVpcs",
-        "ec2:DescribeSubnets",
-        "ec2:DescribeSecurityGroups",
-        "ec2:CreateTags",
-        "ec2:DeleteNetworkInterface"
-      ],
-      "Resource": "*"
-    }
-  ]
-}
-```
-
-Create the log group before the stream, so the role can write to it:
-
-```bash
-aws logs create-log-group --log-group-name /aws/kinesisfirehose/fraud-lab-scored --region us-east-1
-```
-
-### MSK Connect role
-
-Attach this to `fraud-lab-connect-role`. Add the `es:ESHttp*` statement after the OpenSearch domain exists, using the domain ARN from the domain page.
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": [
-        "kafka:DescribeCluster",
-        "kafka:GetBootstrapBrokers"
-      ],
-      "Resource": "arn:aws:kafka:us-east-1:<ACCOUNT_ID>:cluster/fraud-lab-msk/*"
-    },
-    {
-      "Effect": "Allow",
-      "Action": [
-        "kafka-cluster:Connect",
-        "kafka-cluster:DescribeCluster",
-        "kafka-cluster:DescribeTopic",
-        "kafka-cluster:ReadData",
-        "kafka-cluster:DescribeGroup",
-        "kafka-cluster:AlterGroup"
-      ],
-      "Resource": [
-        "arn:aws:kafka:us-east-1:<ACCOUNT_ID>:cluster/fraud-lab-msk/*",
-        "arn:aws:kafka:us-east-1:<ACCOUNT_ID>:topic/fraud-lab-msk/*",
-        "arn:aws:kafka:us-east-1:<ACCOUNT_ID>:group/fraud-lab-msk/*"
-      ]
-    },
-    {
-      "Effect": "Allow",
-      "Action": ["s3:ListBucket", "s3:GetBucketLocation"],
-      "Resource": "arn:aws:s3:::fraud-lab-<ACCOUNT_ID>-us-east-1"
-    },
-    {
-      "Effect": "Allow",
-      "Action": ["s3:GetObject", "s3:PutObject", "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts"],
-      "Resource": [
-        "arn:aws:s3:::fraud-lab-<ACCOUNT_ID>-us-east-1/logs/*",
-        "arn:aws:s3:::fraud-lab-<ACCOUNT_ID>-us-east-1/plugins/*"
-      ]
-    },
-    {
-      "Effect": "Allow",
-      "Action": [
-        "ec2:CreateNetworkInterface",
-        "ec2:DescribeNetworkInterfaces",
-        "ec2:DescribeVpcs",
-        "ec2:DescribeSubnets",
-        "ec2:DescribeSecurityGroups",
-        "ec2:CreateTags",
-        "ec2:DeleteNetworkInterface"
-      ],
-      "Resource": "*"
-    }
-  ]
-}
-```
-
-### EC2 role
-
-Attach this to `fraud-lab-ec2-role`, then create the instance profile. `CreateTopic` is here so the box can create the two topics. The Lambda roles do not get that action.
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
     {
       "Effect": "Allow",
       "Action": [
@@ -928,72 +659,286 @@ Attach this to `fraud-lab-ec2-role`, then create the instance profile. `CreateTo
     },
     {
       "Effect": "Allow",
-      "Action": ["s3:GetObject"],
-      "Resource": "arn:aws:s3:::fraud-lab-<ACCOUNT_ID>-us-east-1/reference/*"
+      "Action": "sagemaker:InvokeEndpoint",
+      "Resource": "arn:aws:sagemaker:us-east-1:<ACCOUNT_ID>:endpoint/fraud-lab-endpoint"
     },
     {
       "Effect": "Allow",
-      "Action": ["s3:PutObject"],
-      "Resource": "arn:aws:s3:::fraud-lab-<ACCOUNT_ID>-us-east-1/layers/*"
-    }
-  ]
-}
-```
-
-```bash
-aws iam create-instance-profile --instance-profile-name fraud-lab-ec2-profile
-aws iam add-role-to-instance-profile \
-  --instance-profile-name fraud-lab-ec2-profile \
-  --role-name fraud-lab-ec2-role
-```
-
-### Redshift copy role
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": ["s3:GetObject", "s3:ListBucket"],
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "s3:AbortMultipartUpload",
+        "s3:ListMultipartUploadParts",
+        "s3:GetBucketLocation",
+        "s3:ListBucket",
+        "s3:ListBucketMultipartUploads"
+      ],
       "Resource": [
         "arn:aws:s3:::fraud-lab-<ACCOUNT_ID>-us-east-1",
-        "arn:aws:s3:::fraud-lab-<ACCOUNT_ID>-us-east-1/analytics/*"
+        "arn:aws:s3:::fraud-lab-<ACCOUNT_ID>-us-east-1/*"
       ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": "sns:Publish",
+      "Resource": "arn:aws:sns:us-east-1:<ACCOUNT_ID>:fraud-lab-alerts"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents",
+        "logs:DescribeLogGroups",
+        "logs:DescribeLogStreams"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "ec2:CreateNetworkInterface",
+        "ec2:CreateNetworkInterfacePermission",
+        "ec2:DescribeNetworkInterfaces",
+        "ec2:DescribeVpcs",
+        "ec2:DescribeSubnets",
+        "ec2:DescribeSecurityGroups",
+        "ec2:DescribeDhcpOptions",
+        "ec2:DeleteNetworkInterface",
+        "ec2:AssignPrivateIpAddresses",
+        "ec2:UnassignPrivateIpAddresses",
+        "ec2:CreateTags"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "es:ESHttpGet",
+        "es:ESHttpPost",
+        "es:ESHttpPut",
+        "es:ESHttpHead"
+      ],
+      "Resource": "arn:aws:es:us-east-1:<ACCOUNT_ID>:domain/fraud-lab-search/*"
     }
   ]
 }
 ```
 
-You associate this role with the namespace in phase 10. Redshift will refuse the association until the role’s trust policy contains the Redshift service principal.
+Phase 10 associates this same role with the Redshift namespace. The trust policy already contains `redshift.amazonaws.com` and `redshift-serverless.amazonaws.com`, which is what that association checks.
 
 ---
 
-## Phase 4. Toy SageMaker model and endpoint
+## Phase 4. EC2 and a Python producer
 
-You do this on your laptop while MSK is still creating. The model never sees a real card. It only learns “large amount looks like the rows I labeled 1.”
+Wait until MSK is **Active** before this phase.
 
-### SageMaker execution role
+### Bootstrap brokers
 
-Attach the AWS managed policy `AmazonSageMakerFullAccess` to `fraud-lab-sagemaker-role`. That policy lets SageMaker write logs and pull the AWS scikit-learn image. It does **not** let SageMaker read `fraud-lab-<ACCOUNT_ID>-us-east-1`, because the managed policy only allows buckets with `sagemaker` in the name. Add this inline policy as well:
+MSK → `fraud-lab-msk` → **View client information**.
 
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": ["s3:GetObject"],
-      "Resource": "arn:aws:s3:::fraud-lab-<ACCOUNT_ID>-us-east-1/models/*"
-    },
-    {
-      "Effect": "Allow",
-      "Action": ["s3:ListBucket"],
-      "Resource": "arn:aws:s3:::fraud-lab-<ACCOUNT_ID>-us-east-1"
-    }
-  ]
-}
+Copy **Private endpoint**, the IAM bootstrap string on port **9098**. EC2, Flink, and Firehose use it. Write it down as the private string.
+
+Copy **Public endpoint**, the IAM bootstrap string on port **9198**. Only the ingest Lambda uses it. If the public field is missing, public access is not finished yet. Wait until the cluster is Active again and open the page a second time.
+
+The private string is a private IP. EC2, Flink, and Firehose sit in the default VPC, so they can open it. The ingest Lambda stays outside the VPC, because a function inside a VPC has no public IP and would need a NAT Gateway to call the SageMaker endpoint. From outside the VPC the only brokers it can reach are these public ones. The security group lets port 9198 in from the internet. `fraud-lab-role` is what decides whether the write is allowed.
+
+### Instance
+
+EC2 → Launch instance.
+
+| Setting | Value |
+| --- | --- |
+| Name | `fraud-lab-generator` |
+| AMI | Amazon Linux 2023 |
+| Type | `t3.micro` |
+| Key pair | Create `fraud-lab-key`, download the `.pem`, `chmod 400` it |
+| Network | the default VPC, one of the two default subnets, auto-assign public IP on |
+| Security group | `fraud-lab` |
+| IAM instance profile | `fraud-lab-role` |
+| Storage | Default 8 GiB is enough. |
+
+SSH in:
+
+```bash
+ssh -i fraud-lab-key.pem ec2-user@<public-dns>
 ```
+
+On the instance:
+
+```bash
+sudo dnf install -y python3-pip
+pip3 install --user kafka-python aws-msk-iam-sasl-signer-python
+```
+
+Those two packages are the client. `kafka-python` creates topics, sends records, and reads them. `aws-msk-iam-sasl-signer-python` signs each connection with the instance role. MSK is still the broker.
+
+### Write `produce_transactions.py`
+
+Create this on the instance and type it. It writes straight to the `transactions` topic. SageMaker is not in this path, so the records have no `model_score`. That is the point: you can see events on the topic before the model exists. The key is `customer_id`, which is what Flink groups on later.
+
+Customers are `cust_001` through `cust_005`, the same ids as `reference/customers.json`. About one event in four has an amount between 450 and 1200. About 15% use a country other than the customer's home country. After those events it sends 4 small amounts for `cust_002` with almost no delay. That burst is what trips the 5-minute velocity rule once Flink is running.
+
+```python
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import random
+import time
+import uuid
+from datetime import datetime, timezone
+
+from aws_msk_iam_sasl_signer import MSKAuthTokenProvider
+from kafka import KafkaConsumer, KafkaProducer
+from kafka.admin import KafkaAdminClient, NewTopic
+from kafka.net.sasl.oauth import AbstractTokenProvider
+
+REGION = "us-east-1"
+TOPIC = "transactions"
+CUSTOMERS = [
+    {"customer_id": "cust_001", "country": "US"},
+    {"customer_id": "cust_002", "country": "US"},
+    {"customer_id": "cust_003", "country": "DE"},
+    {"customer_id": "cust_004", "country": "US"},
+    {"customer_id": "cust_005", "country": "BR"},
+]
+MERCHANTS = ["merch_10", "merch_12", "merch_18", "merch_44"]
+COUNTRIES = ["US", "DE", "BR", "NG"]
+
+
+class MSKTokenProvider(AbstractTokenProvider):
+    def token(self):
+        token, _ = MSKAuthTokenProvider.generate_auth_token(REGION)
+        return token
+
+
+def build_event(customer=None, amount=None):
+    customer = customer or random.choice(CUSTOMERS)
+    if amount is None:
+        amount = (
+            round(random.uniform(450, 1200), 2)
+            if random.random() < 0.25
+            else round(random.uniform(8, 180), 2)
+        )
+    country = random.choice(COUNTRIES) if random.random() < 0.15 else customer["country"]
+    return {
+        "transaction_id": str(uuid.uuid4()),
+        "event_timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "customer_id": customer["customer_id"],
+        "merchant_id": random.choice(MERCHANTS),
+        "amount": amount,
+        "currency": "USD",
+        "country": country,
+        "card_present": random.random() < 0.3,
+        "ip_address": f"203.0.113.{random.randint(1, 250)}",
+    }
+
+
+def kafka_kwargs(bootstrap):
+    return {
+        "bootstrap_servers": [server.strip() for server in bootstrap.split(",") if server.strip()],
+        "security_protocol": "SASL_SSL",
+        "sasl_mechanism": "OAUTHBEARER",
+        "sasl_oauth_token_provider": MSKTokenProvider(),
+    }
+
+
+def ensure_topics(bootstrap):
+    admin = KafkaAdminClient(**kafka_kwargs(bootstrap))
+    existing = set(admin.list_topics())
+    missing = [
+        NewTopic(name=name, num_partitions=2, replication_factor=2)
+        for name in ("transactions", "processed_transactions")
+        if name not in existing
+    ]
+    if missing:
+        admin.create_topics(missing)
+    admin.close()
+
+
+def consume(bootstrap, topic):
+    consumer = KafkaConsumer(
+        topic,
+        group_id="fraud-lab-ec2",
+        auto_offset_reset="earliest",
+        value_deserializer=lambda raw: json.loads(raw.decode("utf-8")),
+        **kafka_kwargs(bootstrap),
+    )
+    for record in consumer:
+        print(json.dumps(record.value))
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Produce raw transactions to MSK")
+    parser.add_argument("--count", type=int, default=10)
+    parser.add_argument("--sleep", type=float, default=0.3)
+    parser.add_argument("--burst-customer", default="cust_002")
+    parser.add_argument("--burst", type=int, default=4)
+    parser.add_argument("--consume", action="store_true")
+    parser.add_argument("--topic", default=TOPIC)
+    args = parser.parse_args()
+    bootstrap = os.environ["BOOTSTRAP"]
+    if args.consume:
+        consume(bootstrap, args.topic)
+        return
+    ensure_topics(bootstrap)
+    producer = KafkaProducer(
+        **kafka_kwargs(bootstrap),
+        value_serializer=lambda value: json.dumps(value).encode("utf-8"),
+        key_serializer=lambda key: key.encode("utf-8"),
+        acks="all",
+    )
+
+    def send(event):
+        future = producer.send(TOPIC, key=event["customer_id"], value=event)
+        future.get(timeout=10)
+        print(f"{event['customer_id']} amount={event['amount']} country={event['country']}")
+
+    for index in range(args.count):
+        send(build_event())
+        time.sleep(args.sleep)
+
+    burst_customer = next(row for row in CUSTOMERS if row["customer_id"] == args.burst_customer)
+    print(f"velocity burst for {args.burst_customer}")
+    for _ in range(args.burst):
+        send(build_event(customer=burst_customer, amount=round(random.uniform(15, 60), 2)))
+        time.sleep(0.2)
+
+    producer.flush()
+    producer.close()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+In one SSH session, paste the private port 9098 string and start a consumer:
+
+```bash
+export BOOTSTRAP="b-1....:9098,b-2....:9098"
+python3 produce_transactions.py --consume --topic transactions
+```
+
+The consumer needs permission to join a group. `fraud-lab-role` already allows `kafka-cluster:AlterGroup` on `arn:aws:kafka:us-east-1:<ACCOUNT_ID>:group/fraud-lab-msk/*`. If the consumer fails on group authorization, confirm that action is still on the role.
+
+In a second SSH session, set `BOOTSTRAP` to the private port 9098 string you copied from the cluster page:
+
+```bash
+export BOOTSTRAP="b-1....:9098,b-2....:9098"
+python3 produce_transactions.py --count 5
+```
+
+Checkpoint: the script prints a customer and an amount for each send, and the consumer prints the same JSON lines. Ctrl-C the consumer. Leave the instance running.
+
+Phase 7 adds `generate_data_ec2.py`, which posts the same events to API Gateway so the ingest Lambda can attach a model score. This script stays the way you put raw events on the topic.
+
+---
+
+## Phase 5. Toy SageMaker model and endpoint
+
+You do this on your laptop after the topic has records. The model never sees a real card. It only learns “large amount looks like the rows I labeled 1.” When you create the model, set the execution role to `fraud-lab-role`.
 
 ### Write `train_toy_model.py`
 
@@ -1068,202 +1013,48 @@ def output_fn(prediction, accept):
     return json.dumps(prediction), "application/json"
 ```
 
-Package the script at the root of a second archive:
+On your laptop, pack `inference.py` at the root of a second archive:
 
 ```bash
 tar -czf sourcedir.tar.gz inference.py
-aws s3 cp model.tar.gz "s3://${BUCKET}/models/fraud-toy/model.tar.gz"
-aws s3 cp sourcedir.tar.gz "s3://${BUCKET}/models/fraud-toy/sourcedir.tar.gz"
 ```
+
+S3 → your bucket → Create folder `models/fraud-toy` → Upload `model.tar.gz` and `sourcedir.tar.gz` into that folder.
 
 ### Create the model, the config, and the endpoint
 
-The image URI below is the AWS scikit-learn 1.2-1 CPU image in **us-east-1**. If `create-model` says the image does not exist, look up “SageMaker Docker Registry Paths” for your Region and replace it. The container version must stay 1.2-1 so it matches the library you trained with.
+The image below is the AWS scikit-learn 1.2-1 CPU image in **us-east-1**. If the console rejects it, look up “SageMaker Docker Registry Paths” for your Region and replace it. The container version must stay 1.2-1 so it matches the library you trained with.
 
-```bash
-export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-
-cat > /tmp/fraud-model.json <<EOF
-{
-  "ModelName": "fraud-lab-toy",
-  "ExecutionRoleArn": "arn:aws:iam::${ACCOUNT_ID}:role/fraud-lab-sagemaker-role",
-  "PrimaryContainer": {
-    "Image": "683313688378.dkr.ecr.us-east-1.amazonaws.com/sagemaker-scikit-learn:1.2-1-cpu-py3",
-    "ModelDataUrl": "s3://${BUCKET}/models/fraud-toy/model.tar.gz",
-    "Environment": {
-      "SAGEMAKER_PROGRAM": "inference.py",
-      "SAGEMAKER_SUBMIT_DIRECTORY": "s3://${BUCKET}/models/fraud-toy/sourcedir.tar.gz"
-    }
-  }
-}
-EOF
-
-cat > /tmp/fraud-endpoint-config.json <<EOF
-{
-  "EndpointConfigName": "fraud-lab-endpoint-config",
-  "ProductionVariants": [
-    {
-      "VariantName": "AllTraffic",
-      "ModelName": "fraud-lab-toy",
-      "ServerlessConfig": {
-        "MemorySizeInMB": 1024,
-        "MaxConcurrency": 1
-      }
-    }
-  ]
-}
-EOF
-
-aws sagemaker create-model --region us-east-1 --cli-input-json file:///tmp/fraud-model.json
-aws sagemaker create-endpoint-config --region us-east-1 --cli-input-json file:///tmp/fraud-endpoint-config.json
-aws sagemaker create-endpoint \
-  --region us-east-1 \
-  --endpoint-name fraud-lab-endpoint \
-  --endpoint-config-name fraud-lab-endpoint-config
-```
-
-Wait until the status is `InService`. Creation often takes 5–10 minutes.
-
-```bash
-aws sagemaker describe-endpoint \
-  --region us-east-1 \
-  --endpoint-name fraud-lab-endpoint \
-  --query EndpointStatus \
-  --output text
-```
-
-### Call the endpoint yourself
-
-The first call starts the serverless container, so give it half a minute.
-
-```bash
-aws sagemaker-runtime invoke-endpoint \
-  --region us-east-1 \
-  --endpoint-name fraud-lab-endpoint \
-  --content-type application/json \
-  --accept application/json \
-  --body '{"amount":850}' \
-  /tmp/fraud-high.json
-
-aws sagemaker-runtime invoke-endpoint \
-  --region us-east-1 \
-  --endpoint-name fraud-lab-endpoint \
-  --content-type application/json \
-  --accept application/json \
-  --body '{"amount":20}' \
-  /tmp/fraud-low.json
-
-cat /tmp/fraud-high.json /tmp/fraud-low.json
-```
-
-Checkpoint: amount 850 has `"prediction": 1` and a score near 1. Amount 20 has `"prediction": 0` and a score near 0. Flink will turn prediction 1 into `model_outcome` `review`.
-
----
-
-## Phase 5. EC2, topics, and a manual record
-
-Wait until MSK is **Active** before this phase.
-
-### Bootstrap brokers
-
-```bash
-CLUSTER_ARN=$(aws kafka list-clusters-v2 --region us-east-1 \
-  --query "ClusterInfoList[?ClusterName=='fraud-lab-msk'].ClusterArn" --output text)
-
-aws kafka get-bootstrap-brokers --region us-east-1 --cluster-arn "$CLUSTER_ARN"
-```
-
-Copy `BootstrapBrokerStringSaslIam`. It looks like `b-1.xxx.kafka.us-east-1.amazonaws.com:9098,b-2.xxx.kafka.us-east-1.amazonaws.com:9098`. Save it as `BOOTSTRAP`.
-
-### Instance
-
-EC2 → Launch instance.
+SageMaker → Inference → Models → Create model.
 
 | Setting | Value |
 | --- | --- |
-| Name | `fraud-lab-generator` |
-| AMI | Amazon Linux 2023 |
-| Type | `t3.micro` |
-| Key pair | Create `fraud-lab-key`, download the `.pem`, `chmod 400` it |
-| Network | `fraud-lab-vpc`, subnet `fraud-lab-public-a`, auto-assign public IP |
-| Security group | `sg-ec2` |
-| IAM instance profile | `fraud-lab-ec2-profile` |
-| Storage | 20 GiB gp3 is enough. The Kafka CLI tarball needs a few hundred MB. |
+| Model name | `fraud-lab-toy` |
+| IAM role | `fraud-lab-role` |
+| Container | Provide model artifacts and an inference image |
+| Inference image | `683313688378.dkr.ecr.us-east-1.amazonaws.com/sagemaker-scikit-learn:1.2-1-cpu-py3` |
+| Model artifacts | `s3://fraud-lab-<ACCOUNT_ID>-us-east-1/models/fraud-toy/model.tar.gz` |
+| Environment | `SAGEMAKER_PROGRAM` = `inference.py` |
+| Environment | `SAGEMAKER_SUBMIT_DIRECTORY` = `s3://fraud-lab-<ACCOUNT_ID>-us-east-1/models/fraud-toy/sourcedir.tar.gz` |
 
-SSH in:
+SageMaker → Inference → Endpoint configurations → Create endpoint configuration.
 
-```bash
-ssh -i fraud-lab-key.pem ec2-user@<public-dns>
-```
+| Setting | Value |
+| --- | --- |
+| Name | `fraud-lab-endpoint-config` |
+| Type | Serverless |
+| Model | `fraud-lab-toy` |
+| Memory | 1024 MB |
+| Max concurrency | 1 |
 
-On the instance:
+SageMaker → Inference → Endpoints → Create endpoint.
 
-```bash
-sudo dnf install -y java-17-amazon-corretto-headless python3-pip
-pip3 install --user kafka-python aws-msk-iam-sasl-signer
+| Setting | Value |
+| --- | --- |
+| Endpoint name | `fraud-lab-endpoint` |
+| Endpoint configuration | `fraud-lab-endpoint-config` |
 
-# Match this to the Kafka version shown on the MSK cluster page.
-cd /home/ec2-user
-curl -fsSL -O https://archive.apache.org/dist/kafka/3.7.0/kafka_2.13-3.7.0.tgz
-tar -xzf kafka_2.13-3.7.0.tgz
-sudo mkdir -p /opt/kafka
-sudo mv kafka_2.13-3.7.0 /opt/kafka/kafka
-curl -fsSL -o /opt/kafka/kafka/libs/aws-msk-iam-auth-2.2.0-all.jar \
-  https://repo1.maven.org/maven2/software/amazon/msk/aws-msk-iam-auth/2.2.0/aws-msk-iam-auth-2.2.0-all.jar
-```
-
-If the Apache archive has moved the 3.7.0 tarball, download the version that matches the cluster from `https://kafka.apache.org/downloads` and use that directory below.
-
-`/home/ec2-user/kafka-client.properties`:
-
-```properties
-security.protocol=SASL_SSL
-sasl.mechanism=AWS_MSK_IAM
-sasl.jaas.config=software.amazon.msk.auth.iam.IAMLoginModule required;
-sasl.client.callback.handler.class=software.amazon.msk.auth.iam.IAMClientCallbackHandler
-```
-
-```bash
-export BOOTSTRAP="b-1....:9098,b-2....:9098"
-export CLASSPATH="/opt/kafka/kafka/libs/aws-msk-iam-auth-2.2.0-all.jar"
-
-/opt/kafka/kafka/bin/kafka-topics.sh \
-  --bootstrap-server "$BOOTSTRAP" \
-  --command-config /home/ec2-user/kafka-client.properties \
-  --create --topic transactions \
-  --partitions 2 --replication-factor 2
-
-/opt/kafka/kafka/bin/kafka-topics.sh \
-  --bootstrap-server "$BOOTSTRAP" \
-  --command-config /home/ec2-user/kafka-client.properties \
-  --create --topic processed_transactions \
-  --partitions 2 --replication-factor 2
-```
-
-Produce one record and read it back. In one SSH session:
-
-```bash
-/opt/kafka/kafka/bin/kafka-console-consumer.sh \
-  --bootstrap-server "$BOOTSTRAP" \
-  --consumer.config /home/ec2-user/kafka-client.properties \
-  --topic transactions --from-beginning
-```
-
-The consumer needs permission to join a group. The EC2 role’s group statement covers that. If the consumer fails on group authorization, confirm `kafka-cluster:AlterGroup` is on `arn:aws:kafka:us-east-1:<ACCOUNT_ID>:group/fraud-lab-msk/*`.
-
-In a second SSH session:
-
-```bash
-echo '{"transaction_id":"manual-1","event_timestamp":"2026-09-27T15:00:00Z","customer_id":"cust_001","merchant_id":"merch_12","amount":42.0,"currency":"USD","country":"US","card_present":false,"ip_address":"203.0.113.10"}' \
-  | /opt/kafka/kafka/bin/kafka-console-producer.sh \
-      --bootstrap-server "$BOOTSTRAP" \
-      --producer.config /home/ec2-user/kafka-client.properties \
-      --topic transactions
-```
-
-Checkpoint: the consumer prints the JSON line. Ctrl-C the consumer. Leave the instance running.
-
-You will write `generate_data_ec2.py` in phase 7, after the API exists, and run it on this instance. The generator only speaks HTTP, so it has nothing to call until then.
+Wait until the status is **InService**. Creation often takes 5–10 minutes. Refresh the endpoint page. The score check happens in phase 7, when you POST an amount through the API.
 
 ---
 
@@ -1279,9 +1070,9 @@ What each part is for:
 - `kafka_security_properties` turns on TLS and MSK IAM auth. There is no username.
 - `load_reference` reads `reference/customers.json` from S3 once, when the subtask starts, and builds a dict keyed by `customer_id`.
 - `customer_key` is the Kafka partition key Flink uses so one customer's events stay together.
-- `ScoreTransactions.open` loads reference data, creates the SageMaker Runtime client, and allocates list state for timestamps.
-- `process_element` drops timestamps older than five minutes, calls `invoke_endpoint` with JSON `{"amount": ...}`, and emits one JSON line. A model error still emits a record with `model_outcome` `model_error`, so the rest of the pipeline keeps moving.
-- Final `fraud_outcome` becomes `review` when the stream itself found `country_mismatch` (amount over 200 and country differs from `home_country`) or `velocity` (4 or more events in the window). Otherwise it keeps `model_outcome`.
+- `ScoreTransactions.open` loads reference data and allocates list state for timestamps.
+- `process_element` drops timestamps older than five minutes, copies `model_score` and `model_outcome` when the Lambda put them on the record, and emits one JSON line. A record you produced by hand has neither field, so those values become `not_scored` and `-1`.
+- Final `fraud_outcome` becomes `review` when the stream itself found `country_mismatch` (amount over 200 and country differs from `home_country`) or `velocity` (4 or more events in the window). Otherwise it keeps `model_outcome` when that value is `approve` or `review`.
 - `main` wires source → key by → process → sink, parallelism 1, checkpoint every 60 seconds.
 
 ```python
@@ -1362,13 +1153,9 @@ def customer_key(raw):
 class ScoreTransactions(KeyedProcessFunction):
     def open(self, runtime_context):
         groups = load_property_groups()
-        model = property_map(groups, "SageMaker")
         reference = property_map(groups, "Reference")
-        self.region = model.get("aws.region", "us-east-1")
-        self.endpoint_name = model["endpoint.name"]
-        self.score_threshold = float(model.get("score.threshold", "0.5"))
+        self.region = reference.get("aws.region", "us-east-1")
         self.reference = load_reference(reference["bucket"], reference["key"], self.region)
-        self.runtime = boto3.client("sagemaker-runtime", region_name=self.region)
         self.event_times = runtime_context.get_list_state(
             ListStateDescriptor("event_times_ms", Types.LONG())
         )
@@ -1397,24 +1184,14 @@ class ScoreTransactions(KeyedProcessFunction):
         if len(recent) >= VELOCITY_THRESHOLD:
             reasons.append("velocity")
 
-        model_outcome = "approve"
-        model_score = 0.0
-        try:
-            response = self.runtime.invoke_endpoint(
-                EndpointName=self.endpoint_name,
-                ContentType="application/json",
-                Accept="application/json",
-                Body=json.dumps({"amount": float(event["amount"])}).encode("utf-8"),
-            )
-            prediction = json.loads(response["Body"].read())
-            model_score = float(prediction["score"])
-            model_outcome = "review" if model_score >= self.score_threshold else "approve"
-        except Exception as exc:
-            model_outcome = "model_error"
+        if "model_score" in event and event.get("model_outcome"):
+            model_score = float(event["model_score"])
+            model_outcome = event["model_outcome"]
+        else:
             model_score = -1.0
-            print(f"FLINK_MODEL_ERROR {event.get('transaction_id')} {exc}")
+            model_outcome = "not_scored"
 
-        fraud_outcome = model_outcome
+        fraud_outcome = model_outcome if model_outcome in ("approve", "review") else "approve"
         if reasons:
             fraud_outcome = "review"
 
@@ -1493,8 +1270,9 @@ From `flink_app`, after `main.py` is saved:
 
 ```bash
 zip fraud-lab-flink.zip main.py
-aws s3 cp fraud-lab-flink.zip "s3://${BUCKET}/flink/fraud-lab-flink.zip"
 ```
+
+S3 → your bucket → Create folder `flink` → Upload `fraud-lab-flink.zip`.
 
 The current Managed Flink Python runtimes include the MSK IAM login module. If the running app later throws `ClassNotFoundException: software.amazon.msk.auth.iam.IAMClientCallbackHandler`, zip the auth jar next to `main.py` under `lib/` and update the application code location:
 
@@ -1514,44 +1292,37 @@ Console → **Amazon Managed Service for Apache Flink** → Create streaming app
 | Name | `fraud-lab-flink` |
 | Runtime | The newest Apache Flink version that offers Python |
 | Application code | `s3://<bucket>/flink/fraud-lab-flink.zip`, object is the zip |
-| Access permissions | `fraud-lab-flink-role` |
+| Access permissions | `fraud-lab-role` |
 | Templates / Studio | Streaming application, not a notebook |
 
 Then configure:
 
 | Setting | Value |
 | --- | --- |
-| VPC | `fraud-lab-vpc` |
-| Subnets | both private subnets |
-| Security group | `sg-flink` |
+| VPC | the default VPC |
+| Subnets | the two default subnets from phase 1 |
+| Security group | `fraud-lab` |
 | Snapshots | Enabled, destination `s3://<bucket>/flink-snapshots/` |
 | Logging | Enabled, log group `/aws/kinesis-analytics/fraud-lab-flink` (create it if the console offers a button) |
 | Parallelism | 1 |
 | Parallelism per KPU | 1 |
 
-Runtime properties. Create these three groups. Property group ids are case-sensitive.
+Runtime properties. Create these two groups. Property group ids are case-sensitive.
 
 Group `MSK`:
 
 | Key | Value |
 | --- | --- |
-| `bootstrap.servers` | the IAM bootstrap string |
+| `bootstrap.servers` | the private IAM string, port 9098 |
 | `input.topic` | `transactions` |
 | `output.topic` | `processed_transactions` |
 | `group.id` | `fraud-lab-flink` |
-
-Group `SageMaker`:
-
-| Key | Value |
-| --- | --- |
-| `aws.region` | `us-east-1` |
-| `endpoint.name` | `fraud-lab-endpoint` |
-| `score.threshold` | `0.5` |
 
 Group `Reference`:
 
 | Key | Value |
 | --- | --- |
+| `aws.region` | `us-east-1` |
 | `bucket` | your bucket name |
 | `key` | `reference/customers.json` |
 
@@ -1561,22 +1332,20 @@ What the code does, so the log lines make sense:
 
 - `load_property_groups()` reads `/etc/flink/application_properties.json`, which Managed Flink writes from the console groups.
 - `build_source` / `build_sink` set SASL IAM on the Kafka client.
-- `ScoreTransactions.open()` loads the S3 file once and creates the SageMaker Runtime client once.
-- `process_element` prunes timestamps older than five minutes, calls `invoke_endpoint`, and yields one JSON line.
-- A SageMaker exception does not drop the event. `model_outcome` becomes `model_error` and the record still reaches the output topic, so you can see the failure in the scored JSON.
+- `ScoreTransactions.open()` loads the S3 file once.
+- `process_element` prunes timestamps older than five minutes and yields one JSON line.
+- A hand-produced record has no model fields. `model_outcome` is `not_scored`. The Lambda path in phase 7 is what fills the score.
 
 ### Prove it
 
-Produce a high-amount event with the console producer from phase 5 (`amount` 850, `customer_id` `cust_001`). Then consume the output topic:
+Run `produce_transactions.py` again from the instance (`--count 1` is enough, amount will sometimes be high). Then consume the output topic:
 
 ```bash
-/opt/kafka/kafka/bin/kafka-console-consumer.sh \
-  --bootstrap-server "$BOOTSTRAP" \
-  --consumer.config /home/ec2-user/kafka-client.properties \
-  --topic processed_transactions --from-beginning
+export BOOTSTRAP="b-1....:9098,b-2....:9098"
+python3 produce_transactions.py --consume --topic processed_transactions
 ```
 
-You want a line with `"fraud_outcome": "review"`, `"model_outcome": "review"`, `"model_score"` near 1, `"home_country": "US"`, `"risk_tier": "low"`.
+You want a line with `"home_country": "US"`, `"risk_tier": "low"`, and `"model_outcome": "not_scored"`. Amount 850 does not become a model review until the request goes through the Lambda in phase 7.
 
 In CloudWatch Logs, open `/aws/kinesis-analytics/fraud-lab-flink` and find `FLINK_SCORED`.
 
@@ -1588,30 +1357,25 @@ Checkpoint: one scored record on `processed_transactions`. Stop the console cons
 
 ## Phase 7. API Gateway and the ingest Lambda
 
+Do this before the SageMaker endpoint. The EC2 box POSTs to API Gateway, and the ingest Lambda writes that JSON to MSK. Leave `ENDPOINT_NAME` unset until phase 5. The function then stores `model_outcome` as `not_scored` and still produces the record. After `fraud-lab-endpoint` is InService, set `ENDPOINT_NAME` and the same function starts scoring `amount`.
+
 ### Layer
 
 Build the layer on the EC2 instance so the native bits, if any, match Amazon Linux. `kafka-python` and the signer are pure Python, so this is straightforward:
 
 ```bash
 rm -rf /tmp/layer && mkdir -p /tmp/layer/python
-pip3 install kafka-python aws-msk-iam-sasl-signer -t /tmp/layer/python
+pip3 install kafka-python aws-msk-iam-sasl-signer-python -t /tmp/layer/python
 cd /tmp/layer && zip -r /tmp/msk-layer.zip python
-aws s3 cp /tmp/msk-layer.zip "s3://${BUCKET}/layers/msk-layer.zip"
 ```
 
-The instance role needs `s3:PutObject` on `layers/*` for that copy. Add it, or upload the zip from your laptop after `scp`.
+Copy `/tmp/msk-layer.zip` to your laptop, then Lambda → Layers → Create layer.
 
-Publish the layer (from a machine whose IAM user can call Lambda):
-
-```bash
-aws lambda publish-layer-version \
-  --region us-east-1 \
-  --layer-name fraud-lab-msk \
-  --content S3Bucket="$BUCKET",S3Key="layers/msk-layer.zip" \
-  --compatible-runtimes python3.12
-```
-
-Note the layer version ARN.
+| Setting | Value |
+| --- | --- |
+| Name | `fraud-lab-msk` |
+| Upload | `msk-layer.zip` |
+| Compatible runtimes | Python 3.12 |
 
 ### Write `aws_api_gateway.py`
 
@@ -1620,10 +1384,11 @@ Create this file yourself. Handler name when you deploy it: `aws_api_gateway.lam
 The function:
 
 1. Reads the HTTP API body. API Gateway may base64-encode it. Decode when `isBase64Encoded` is true.
-2. Requires `customer_id` and `amount`. Fills `transaction_id` and `event_timestamp` when the caller left them out.
-3. Builds one Kafka producer on the first invoke and reuses it on warm starts. IAM auth uses `MSKTokenProvider.generate_auth_token`. The mechanism string for `kafka-python` is `OAUTHBEARER`.
-4. Sends the record with key `customer_id` and `acks=all`. `future.get()` blocks until the broker acknowledges, so HTTP `202` means MSK accepted the write.
-5. Returns `202` and the `transaction_id`.
+2. Calls the SageMaker endpoint with `{"amount": ...}` only when `ENDPOINT_NAME` is set. A score of at least `SCORE_THRESHOLD` (default `0.5`) sets `model_outcome` to `review`. With no endpoint, `model_outcome` is `not_scored`.
+3. Requires `customer_id` and `amount`. Fills `transaction_id` and `event_timestamp` when the caller left them out. Puts `model_score` and `model_outcome` on the Kafka record.
+4. Builds one Kafka producer on the first invoke and reuses it on warm starts. IAM auth uses `MSKAuthTokenProvider.generate_auth_token`. The mechanism string for `kafka-python` is `OAUTHBEARER`. `BOOTSTRAP_SERVERS` must be the public string, port 9198.
+5. Sends the record with key `customer_id` and `acks=all`. `future.get()` blocks until the broker acknowledges, so HTTP `202` means MSK accepted the write.
+6. Returns `202`, the `transaction_id`, and the model fields. Flink may still change the final `fraud_outcome` after this returns.
 
 ```python
 import base64
@@ -1632,17 +1397,22 @@ import os
 import uuid
 from datetime import datetime, timezone
 
+import boto3
 from aws_msk_iam_sasl_signer import MSKAuthTokenProvider
 from kafka import KafkaProducer
+from kafka.net.sasl.oauth import AbstractTokenProvider
 
-REGION = os.environ.get("AWS_REGION", "us-east-1")
+REGION = os.environ.get("AWS_REGION", "us-east-2")
 BOOTSTRAP = os.environ["BOOTSTRAP_SERVERS"]
 TOPIC = os.environ.get("TOPIC_NAME", "transactions")
+ENDPOINT_NAME = os.environ.get("ENDPOINT_NAME", "")
+SCORE_THRESHOLD = float(os.environ.get("SCORE_THRESHOLD", "0.5"))
 
 _producer = None
+_runtime = boto3.client("sagemaker-runtime")
 
 
-class MSKTokenProvider:
+class MSKTokenProvider(AbstractTokenProvider):
     def token(self):
         token, _ = MSKAuthTokenProvider.generate_auth_token(REGION)
         return token
@@ -1661,9 +1431,23 @@ def get_producer():
             acks="all",
             retries=3,
             request_timeout_ms=10000,
-            api_version_auto_timeout_ms=10000,
         )
     return _producer
+
+
+def score_amount(amount):
+    if not ENDPOINT_NAME:
+        return None, "not_scored"
+    response = _runtime.invoke_endpoint(
+        EndpointName=ENDPOINT_NAME,
+        ContentType="application/json",
+        Accept="application/json",
+        Body=json.dumps({"amount": amount}).encode("utf-8"),
+    )
+    prediction = json.loads(response["Body"].read())
+    score = float(prediction["score"])
+    outcome = "review" if score >= SCORE_THRESHOLD else "approve"
+    return score, outcome
 
 
 def lambda_handler(event, context):
@@ -1685,6 +1469,7 @@ def lambda_handler(event, context):
         "card_present": bool(incoming.get("card_present", False)),
         "ip_address": incoming.get("ip_address", "203.0.113.10"),
     }
+    transaction["model_score"], transaction["model_outcome"] = score_amount(transaction["amount"])
 
     get_producer().send(TOPIC, key=customer_id, value=transaction).get(timeout=10)
 
@@ -1692,40 +1477,44 @@ def lambda_handler(event, context):
         "statusCode": 202,
         "headers": {"content-type": "application/json"},
         "body": json.dumps(
-            {"transaction_id": transaction["transaction_id"], "status": "accepted"}
+            {
+                "transaction_id": transaction["transaction_id"],
+                "status": "accepted",
+                "model_score": transaction["model_score"],
+                "model_outcome": transaction["model_outcome"],
+            }
         ),
     }
 ```
 
 ### Deploy the function
 
-Create the function **without** the VPC first, upload the file, then attach the VPC. A function created in a private subnet with a broken role looks like a hang; attaching the VPC second makes the error easier to read.
-
-```bash
-zip ingest.zip aws_api_gateway.py
-
-aws lambda create-function \
-  --region us-east-1 \
-  --function-name fraud-lab-ingest \
-  --runtime python3.12 \
-  --handler aws_api_gateway.lambda_handler \
-  --role "arn:aws:iam::<ACCOUNT_ID>:role/fraud-lab-lambda-ingest-role" \
-  --zip-file fileb://ingest.zip \
-  --timeout 20 \
-  --memory-size 256 \
-  --layers "<LAYER_VERSION_ARN>" \
-  --environment "Variables={BOOTSTRAP_SERVERS=<IAM bootstrap string>,TOPIC_NAME=transactions}"
-```
-
-Attach the VPC: Lambda → fraud-lab-ingest → Configuration → VPC → Edit.
+Lambda → Create function → Author from scratch.
 
 | Setting | Value |
 | --- | --- |
-| VPC | `fraud-lab-vpc` |
-| Subnets | both private subnets |
-| Security group | `sg-lambda` |
+| Function name | `fraud-lab-ingest` |
+| Runtime | Python 3.12 |
+| Execution role | Use an existing role, `fraud-lab-role` |
 
-The first update can take a minute while Lambda creates network interfaces.
+Leave the function out of every VPC. Do not open the VPC panel.
+
+In the code editor, create a file named `aws_api_gateway.py`, paste the program, delete the sample `lambda_function.py`, and Deploy. Runtime settings → Handler: `aws_api_gateway.lambda_handler`.
+
+Configuration → General configuration → Edit: timeout **29** seconds, memory **256** MB.
+
+Configuration → Environment variables:
+
+| Key | Value |
+| --- | --- |
+| `BOOTSTRAP_SERVERS` | the public bootstrap string, port 9198 |
+| `TOPIC_NAME` | `transactions` |
+| `ENDPOINT_NAME` | Leave unset until `fraud-lab-endpoint` is InService. Then set it to `fraud-lab-endpoint`. |
+| `SCORE_THRESHOLD` | `0.5` |
+
+Code → Layers → Add a layer → Custom layers → `fraud-lab-msk`, the version you just created.
+
+With `ENDPOINT_NAME` unset, the function only writes to MSK. After you set it, the first call can take about 20 seconds while the serverless endpoint starts. If API Gateway returns a timeout, send the same request again.
 
 ### HTTP API
 
@@ -1744,19 +1533,19 @@ Access logs: Stages → `$default` → Logs → Edit. Create log group `/aws/api
 $context.requestId $context.httpMethod $context.routeKey $context.status $context.integrationStatus $context.integrationLatency
 ```
 
-The API needs permission to invoke the function. The console adds it when you select the Lambda integration. If you created the route with the CLI and the API returns 500 with “not authorized to invoke”, add the Lambda resource-based policy from the Lambda console → Configuration → Permissions → Add permission, principal `apigateway.amazonaws.com`.
+The API needs permission to invoke the function. The console adds it when you select the Lambda integration. If the API returns 500 with “not authorized to invoke”, Lambda → `fraud-lab-ingest` → Configuration → Permissions → Add permission, principal `apigateway.amazonaws.com`.
 
 ### Call it
 
 ```bash
-API_URL="https://<api-id>.execute-api.us-east-1.amazonaws.com/transactions"
+API_URL="https://<api-id>.execute-api.us-east-2.amazonaws.com/transactions"
 
 curl -sS -X POST "$API_URL" \
   -H 'content-type: application/json' \
   -d '{"customer_id":"cust_003","amount":900,"merchant_id":"merch_18","country":"DE"}'
 ```
 
-Expected body: `{"transaction_id":"...","status":"accepted"}` and HTTP 202.
+Expected body includes `"status": "accepted"` and `"model_outcome": "review"`, with HTTP 202.
 
 Then consume `processed_transactions` again. `cust_003` has `risk_tier` `high` and `home_country` `DE`. Amount 900 should produce `model_outcome` `review` and a `model_score` near 1.
 
@@ -1865,7 +1654,7 @@ if __name__ == "__main__":
 Run it:
 
 ```bash
-export API_URL="https://<api-id>.execute-api.us-east-1.amazonaws.com/transactions"
+export API_URL="https://<api-id>.execute-api.us-east-2.amazonaws.com/transactions"
 python3 generate_data_ec2.py --count 10
 ```
 
@@ -1877,16 +1666,9 @@ Checkpoint: CloudWatch log group `/aws/lambda/fraud-lab-ingest` has a recent `ST
 
 ### Topic and email
 
-```bash
-aws sns create-topic --region us-east-1 --name fraud-lab-alerts
-aws sns subscribe \
-  --region us-east-1 \
-  --topic-arn "arn:aws:sns:us-east-1:<ACCOUNT_ID>:fraud-lab-alerts" \
-  --protocol email \
-  --notification-endpoint you@example.com
-```
+SNS → Topics → Create topic. Type **Standard**, name `fraud-lab-alerts`.
 
-Open the confirmation email and confirm the subscription. Status must be **Confirmed** before a publish does anything you can see.
+Open the topic → Create subscription. Protocol **Email**, endpoint your address. Open the confirmation email and confirm. Status must be **Confirmed** before a publish does anything you can see.
 
 ### Write `notify_lambda.py`
 
@@ -1926,36 +1708,22 @@ def lambda_handler(event, context):
 
 ### Deploy the function
 
-```bash
-zip notify.zip notify_lambda.py
-aws lambda create-function \
-  --region us-east-1 \
-  --function-name fraud-lab-notify \
-  --runtime python3.12 \
-  --handler notify_lambda.lambda_handler \
-  --role "arn:aws:iam::<ACCOUNT_ID>:role/fraud-lab-lambda-notify-role" \
-  --zip-file fileb://notify.zip \
-  --timeout 30 \
-  --memory-size 256 \
-  --environment "Variables={TOPIC_ARN=arn:aws:sns:us-east-1:<ACCOUNT_ID>:fraud-lab-alerts}"
-```
+Lambda → Create function → Author from scratch. Name `fraud-lab-notify`, runtime Python 3.12, existing role `fraud-lab-role`. Leave VPC empty.
 
-Do **not** put this function in the VPC.
+In the code editor, create `notify_lambda.py`, paste the program, delete the sample file, and Deploy. Handler: `notify_lambda.lambda_handler`. Timeout 30 seconds, memory 256 MB.
 
-Event source mapping, starting at the head of the topic so it does not email you for every historical test record:
+Environment variable `TOPIC_ARN` = the ARN on the SNS topic page (`arn:aws:sns:us-east-1:<ACCOUNT_ID>:fraud-lab-alerts`).
 
-```bash
-aws lambda create-event-source-mapping \
-  --region us-east-1 \
-  --function-name fraud-lab-notify \
-  --event-source-arn "$CLUSTER_ARN" \
-  --topics processed_transactions \
-  --starting-position LATEST \
-  --batch-size 10 \
-  --enabled
-```
+Add trigger → Amazon MSK.
 
-The mapping takes a few minutes to reach state `Enabled`. Until it does, records are not failures; they are waiting.
+| Setting | Value |
+| --- | --- |
+| Cluster | `fraud-lab-msk` |
+| Topic | `processed_transactions` |
+| Starting position | Latest |
+| Batch size | 10 |
+
+Latest means the function skips the test records you already produced, so it does not email you for those. The trigger takes a few minutes to reach **Enabled**. Until it does, records are waiting, not failing.
 
 Send one more high-amount `curl`. You should receive an email whose body is the scored JSON, and a log line `FRAUD_ALERT` in `/aws/lambda/fraud-lab-notify`.
 
@@ -1975,8 +1743,8 @@ Firehose → Create Firehose stream.
 | MSK cluster | `fraud-lab-msk` |
 | Topic | `processed_transactions` |
 | Connectivity | Private bootstrap brokers |
-| Subnets | both private subnets |
-| Security group | `sg-firehose` |
+| Subnets | the two default subnets from phase 1 |
+| Security group | `fraud-lab` |
 | S3 bucket | your fraud-lab bucket |
 | S3 prefix | `analytics/scored/` |
 | Error prefix | `analytics/errors/` |
@@ -1984,18 +1752,16 @@ Firehose → Create Firehose stream.
 | Buffer interval | 60 seconds |
 | New line delimiter | Enabled |
 | Compression | Disabled, so you can open the file and read it |
-| IAM role | `fraud-lab-firehose-role` |
+| IAM role | `fraud-lab-role` |
 | Error logging | Enabled, log group `/aws/kinesisfirehose/fraud-lab-scored` |
 
-Create the stream. Wait until it is Active. Send another `curl`. Wait **two minutes**.
+Create the log group before the stream, so the role can write to it. CloudWatch → Log groups → Create log group, name `/aws/kinesisfirehose/fraud-lab-scored`.
 
-```bash
-aws s3 ls "s3://${BUCKET}/analytics/scored/" --recursive
-```
+Create the stream. Wait until it is Active. Send another request. Wait **two minutes**.
 
-Open one object. Each line is one scored JSON document.
+S3 → your bucket → `analytics/scored/`. Open one object. Each line is one scored JSON document.
 
-If the prefix stays empty, open the `S3Delivery` log stream in that log group, and check the metric `DeliveryToS3.Success` (Firehose → Monitoring). Also confirm `sg-msk` allows 9098 from `sg-firehose`. Firehose will not deliver a partial buffer early just because you are watching.
+If the prefix stays empty, open the `S3Delivery` log stream in that log group, and check the metric `DeliveryToS3.Success` (Firehose → Monitoring). Also confirm `fraud-lab` allows TCP 9098 from itself. Firehose will not deliver a partial buffer early just because you are watching.
 
 ---
 
@@ -2009,15 +1775,15 @@ Redshift → Serverless dashboard.
 | --- | --- |
 | Admin user | `labadmin` and a password you store outside git |
 | Database name | `fraudlab` |
-| IAM role | `fraud-lab-redshift-copy-role`, set as the default role |
+| IAM role | `fraud-lab-role`, set as the default role |
 
 **Workgroup** `fraud-lab-wg`:
 
 | Setting | Value |
 | --- | --- |
-| VPC | `fraud-lab-vpc` |
-| Subnets | both private subnets |
-| Security group | `sg-redshift` |
+| VPC | the default VPC |
+| Subnets | the two default subnets from phase 1 |
+| Security group | `fraud-lab` |
 | Publicly accessible | Off |
 | Enhanced VPC routing | On |
 | Base capacity / max RPU | The minimum the console allows. Set a max so it cannot scale freely. |
@@ -2056,7 +1822,7 @@ Load the files Firehose has written. Replace the bucket name.
 ```sql
 COPY scored_transactions
 FROM 's3://fraud-lab-<ACCOUNT_ID>-us-east-1/analytics/scored/'
-IAM_ROLE 'arn:aws:iam::<ACCOUNT_ID>:role/fraud-lab-redshift-copy-role'
+IAM_ROLE 'arn:aws:iam::<ACCOUNT_ID>:role/fraud-lab-role'
 FORMAT AS JSON 'auto'
 TIMEFORMAT 'auto'
 TRUNCATECOLUMNS
@@ -2181,7 +1947,7 @@ Send ten events with the generator and refresh. `BytesInPerSec` on `transactions
 
 ### A Firehose failure you can read
 
-This drill is the reason error logs exist. Remove `s3:PutObject` from `fraud-lab-firehose-role` for five minutes, send one event, wait two minutes, and read `/aws/kinesisfirehose/fraud-lab-scored`. You should see an access-denied delivery error, and `DeliveryToS3.Success` should stop. Put the permission back and confirm the next flush succeeds. Objects that failed are not always retried forever; send a fresh event after the fix.
+This drill is the reason error logs exist. Remove `s3:PutObject` from `fraud-lab-role` for five minutes, send one event, wait two minutes, and read `/aws/kinesisfirehose/fraud-lab-scored`. You should see an access-denied delivery error, and `DeliveryToS3.Success` should stop. Put the permission back and confirm the next flush succeeds. Objects that failed are not always retried forever; send a fresh event after the fix.
 
 ---
 
@@ -2200,7 +1966,7 @@ OpenSearch Service → Create domain.
 | Deployment | Development, one AZ, one data node |
 | Instance type | `t3.small.search` |
 | EBS | 10 GiB gp3 |
-| Network | VPC, `fraud-lab-vpc`, subnet `fraud-lab-private-a`, security group `sg-opensearch` |
+| Network | the default VPC, one of the two default subnets, security group `fraud-lab` |
 | Fine-grained access control | On |
 | Master user | Internal user database. Username `admin`. Choose a lab password and keep it out of git. |
 | Access policy | Allow the domain’s own ARN for the account, or use the console’s “only this domain” template. The master user is what the connector and EC2 will use. |
@@ -2229,10 +1995,10 @@ MSK Connect → Connectors → Create connector.
 | Connector name | `fraud-lab-s3-log` |
 | Cluster | `fraud-lab-msk` |
 | Authentication | IAM |
-| VPC subnets | both private subnets |
-| Security group | `sg-connect` |
+| VPC subnets | the two default subnets from phase 1 |
+| Security group | `fraud-lab` |
 | Connector capacity | 1 worker, 1 MCU |
-| IAM role | `fraud-lab-connect-role` |
+| IAM role | `fraud-lab-role` |
 
 Connector configuration (merge with any keys the console marks required):
 
@@ -2260,9 +2026,7 @@ sasl.client.callback.handler.class=software.amazon.msk.auth.iam.IAMClientCallbac
 
 Wait until the connector is Running. Send at least 10 events (the generator’s `--count 10`). Then:
 
-```bash
-aws s3 ls "s3://${BUCKET}/logs/" --recursive
-```
+S3 → your bucket → `logs/`.
 
 You want JSON objects. `flush.size=10` means a short test of 3 events will not create a file yet.
 
@@ -2377,19 +2141,20 @@ ORDER BY processed_at;
 
 | What you see | What it usually means |
 | --- | --- |
-| Ingest Lambda times out, no log line after `START` | The function cannot reach the broker. Check `sg-msk` inbound 9098 from `sg-lambda`, the function is in the private subnets, and `BOOTSTRAP_SERVERS` is the **SaslIam** string on port 9098. |
+| Ingest Lambda times out, no log line after `START` | `BOOTSTRAP_SERVERS` is the private 9098 string, or public access is not Active yet. This function needs `BootstrapBrokerStringPublicSaslIam`, port 9198. Also confirm `fraud-lab` allows TCP 9198 from `0.0.0.0/0`. |
+| Ingest Lambda errors on `InvokeEndpoint` | The endpoint is not `InService`, or the ingest role is missing `sagemaker:InvokeEndpoint`. A `ModelError` usually means `inference.py` raised, often because `model.joblib` was pickled with a different scikit-learn than 1.2.1. |
 | `AccessDeniedException` mentioning `kafka-cluster:WriteData` | The role policy has the cluster ARN and is missing the topic ARN, or the cluster UUID in the error does not match a wildcard that is too narrow. |
-| API Gateway 500, Lambda logs empty | API Gateway is not allowed to invoke the function, or the function is still updating its VPC configuration. |
-| Flink stays `Ready`, log shows a missing key | A runtime property group name does not match `MSK`, `SageMaker`, or `Reference`. |
-| `FLINK_MODEL_ERROR` and the scored record says `model_error` | The endpoint is not `InService`, the Flink role cannot `sagemaker:InvokeEndpoint`, or NAT is missing so the private subnet cannot reach `runtime.sagemaker.us-east-1.amazonaws.com`. A `ModelError` in the text usually means `inference.py` raised, often because `model.joblib` was pickled with a different scikit-learn than 1.2.1. |
+| API Gateway 500, Lambda logs empty | API Gateway is not allowed to invoke the function. |
+| Flink stays `Ready`, log shows a missing key | A runtime property group name does not match `MSK` or `Reference`. |
+| Scored record says `model_outcome` `not_scored` after a `curl` | The event did not come from the ingest Lambda. `produce_transactions.py` from phase 4 writes the topic directly and does not call SageMaker. |
 | Scored `risk_tier` is `unknown` | The reference key is wrong, or the file was uploaded as a single pretty-printed array and the customer id field name differs. The loader accepts an array or newline-delimited objects. |
-| Velocity never flips | Fewer than 4 events for that `customer_id` inside five minutes, or the producer key is not `customer_id` so the events landed on different keys. The ingest function sets the key. The console producer from phase 5 does **not**, unless you pass a key separator. Use the API for the velocity test. |
+| Velocity never flips | Fewer than 4 events for that `customer_id` inside five minutes, or the producer key is not `customer_id` so the events landed on different keys. `produce_transactions.py` and the ingest function both set the key. Run the script again after Flink is Running, or use the API. |
 | No email | Subscription is PendingConfirmation, `fraud_outcome` was `approve`, or the event source mapping is not `Enabled`. Look at the mapping’s “Last processing result”. |
 | Firehose prefix empty after 30 seconds | Normal. Wait for the 60-second buffer. Then read the `S3Delivery` log. |
 | `COPY` loads 0 rows | Wrong prefix, or the files are not newline-delimited JSON. Check `STL_LOAD_ERRORS`. Enhanced VPC routing without the S3 gateway endpoint also fails this way, often as a network error rather than a parse error. |
-| `COPY` network timeout | Private route table is missing the S3 gateway endpoint, or enhanced VPC routing is off and the private workgroup has no path out. Turn routing on and confirm the endpoint. |
+| `COPY` network timeout | The S3 gateway endpoint is not on the default VPC’s main route table, or enhanced VPC routing is off. Turn routing on and confirm the endpoint. |
 | OpenSearch connector fails on version | Turn on compatibility mode on the domain. |
-| VPC will not delete | A Flink app, Firehose stream, MSK cluster, OpenSearch domain, NAT Gateway, or Lambda function still has a network interface. Delete those first and wait. |
+| Security group `fraud-lab` will not delete | A Flink app, Firehose stream, MSK cluster, or OpenSearch domain still has a network interface in it. Delete those first and wait. Leave the default VPC in place. |
 
 ---
 
@@ -2397,15 +2162,8 @@ ORDER BY processed_at;
 
 Delete in this order. Later steps fail while earlier resources still hold network interfaces.
 
-1. Stop the generator. Terminate `fraud-lab-generator` when you are finished with SSH. Leave the NAT Gateway’s Elastic IP until step 11, after the NAT Gateway itself is gone.
-2. Delete the SageMaker endpoint, wait until it is gone, then delete the endpoint config and the model:
-
-```bash
-aws sagemaker delete-endpoint --region us-east-1 --endpoint-name fraud-lab-endpoint
-aws sagemaker wait endpoint-deleted --region us-east-1 --endpoint-name fraud-lab-endpoint
-aws sagemaker delete-endpoint-config --region us-east-1 --endpoint-config-name fraud-lab-endpoint-config
-aws sagemaker delete-model --region us-east-1 --model-name fraud-lab-toy
-```
+1. Stop the generator. Terminate `fraud-lab-generator` when you are finished with SSH.
+2. SageMaker → Endpoints → `fraud-lab-endpoint` → Delete. Wait until it disappears. Then delete endpoint configuration `fraud-lab-endpoint-config`, then model `fraud-lab-toy`.
 
 3. Delete both MSK Connect connectors, then the custom plugins.
 4. Stop the Flink application, then delete it.
@@ -2414,22 +2172,16 @@ aws sagemaker delete-model --region us-east-1 --model-name fraud-lab-toy
 7. Delete the HTTP API.
 8. Delete the OpenSearch domain. This one is slow.
 9. Delete the Redshift workgroup, then the namespace.
-10. Delete the MSK cluster. This one is slow.
-11. Delete the NAT Gateway. After it is deleted, release its Elastic IP.
-12. Delete the S3 gateway endpoint.
-13. Delete security groups, subnets, route tables, the internet gateway, and the VPC. If a security group is in use, an ENI is still alive. Wait and retry.
-14. Empty the S3 bucket (including versions if you turned versioning on) and delete it.
+10. Delete the MSK cluster. This one is slow. Deleting it also releases the public IPv4 addresses.
+11. Delete the S3 gateway endpoint `fraud-lab-s3`.
+12. Delete the security group `fraud-lab` after its network interfaces are gone.
+13. S3 → your bucket → Empty, then Delete. Do not delete the default VPC, its subnets, or its internet gateway.
 
-```bash
-aws s3 rm "s3://${BUCKET}" --recursive
-aws s3 rb "s3://${BUCKET}"
-```
+14. Delete the SNS topic.
+15. IAM → Roles → `fraud-lab-role` → Delete. Deleting the role removes the instance profile the console created with it.
+16. Delete the CloudWatch log groups listed in phase 11. Keep the budget, or delete it if you are closing the account’s experiments.
 
-15. Delete the SNS topic.
-16. Delete the IAM roles and instance profile, including `fraud-lab-sagemaker-role`.
-17. Delete the CloudWatch log groups listed in phase 11. Keep the budget, or delete it if you are closing the account’s experiments.
-
-Search the console tag filter `Project=fraud-lab` and the EC2 “Network interfaces” page for leftovers. An orphaned NAT Gateway or MSK cluster is the usual surprise on next month’s bill.
+Search the console tag filter `Project=fraud-lab` and the EC2 “Network interfaces” page for leftovers. An orphaned MSK cluster is the usual surprise on next month’s bill. Leave the default VPC where you found it.
 
 ---
 
@@ -2437,18 +2189,11 @@ Search the console tag filter `Project=fraud-lab` and the EC2 “Network interfa
 
 These are the changes that teach the service, in the order that causes the least damage.
 
-**Score threshold.** Set the Flink property `score.threshold` to `1.1` and restart the application. Send `cust_001`, amount `900`, country `US`. `model_score` stays near 1, and `model_outcome` becomes `approve` because a probability cannot reach 1.1. One domestic event does not trip velocity or the country rule, so `fraud_outcome` is `approve` as well. That shows Flink applies the threshold, and the email path follows `fraud_outcome`. Put the threshold back to `0.5` and restart.
+**Score threshold.** Set the ingest Lambda environment variable `SCORE_THRESHOLD` to `1.1`. Send `cust_001`, amount `900`, country `US`. `model_score` stays near 1, and `model_outcome` becomes `approve` because a probability cannot reach 1.1. One domestic event does not trip velocity or the country rule, so `fraud_outcome` is `approve` as well. That shows the Lambda applies the threshold, and the email path follows `fraud_outcome`. Put the variable back to `0.5`.
 
-**Retrain the cutoff.** Change `train_toy_model.py` so the label flips at 200 instead of 400. Fit again, upload a new `model.tar.gz`, and create `fraud-lab-toy-v2` plus `fraud-lab-endpoint-config-v2` the same way as phase 4, with `ModelName` set to `fraud-lab-toy-v2`. Update the live endpoint:
+**Retrain the cutoff.** Change `train_toy_model.py` so the label flips at 200 instead of 400. Fit again, upload a new `model.tar.gz`, and create model `fraud-lab-toy-v2` plus endpoint configuration `fraud-lab-endpoint-config-v2` the same way as phase 5. SageMaker → Endpoints → `fraud-lab-endpoint` → Update endpoint, and choose `fraud-lab-endpoint-config-v2`.
 
-```bash
-aws sagemaker update-endpoint \
-  --region us-east-1 \
-  --endpoint-name fraud-lab-endpoint \
-  --endpoint-config-name fraud-lab-endpoint-config-v2
-```
-
-Wait until the endpoint is `InService` again. Send amount `250`. `model_outcome` should now be `review`. The stream country rule still needs more than 200 **and** a country mismatch, so a domestic 250 is the model’s decision alone.
+Wait until the endpoint is **InService** again. Send amount `250`. `model_outcome` should now be `review`. The stream country rule still needs more than 200 **and** a country mismatch, so a domestic 250 is the model’s decision alone.
 
 **Reference data.** Add `cust_006` to `reference/customers.json`, upload it, and restart Flink. Send an event for `cust_006`. `risk_tier` should match the file. Then you understand that this join is a startup load, not a continuous S3 watch.
 
@@ -2470,7 +2215,7 @@ Then `TRUNCATE`, `COPY` a single hour prefix (`analytics/scored/2026/09/27/15/` 
 
 **CloudWatch Logs Insights across a failure.** Repeat the Firehose permission drill. Save the Insights query. Add the `DeliveryToS3.Success` widget next to a Logs widget on the dashboard so the graph and the text are on one screen.
 
-**EC2 direct produce.** From the instance, produce straight to `transactions` with `kafka-console-producer.sh`, bypassing API Gateway. Flink still scores it. The API access log does **not** show a line. That is the dashed arrow on the diagram, and it is how you tell a front-door failure apart from a stream failure.
+**EC2 direct produce.** From the instance, run `python3 produce_transactions.py --count 1`. That writes straight to `transactions` and skips API Gateway. Flink still scores it. The API access log does not show a line. That is how you tell a front-door failure apart from a stream failure.
 
 **A second feature.** Add `card_present` as a second column in `train_toy_model.py` (shape `(n, 2)`), teach `inference.py` to read it, and send both fields from Flink: `{"amount": ..., "card_present": 0 or 1}`. Redeploy with `update-endpoint`. One domestic low amount should still approve. You are practicing a contract change across train, endpoint, and Flink together.
 
